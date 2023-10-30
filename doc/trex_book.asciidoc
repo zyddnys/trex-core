@@ -289,7 +289,7 @@ Supported Linux versions:
 
 NOTE: Additional OS versions may be supported by compiling the necessary drivers.
 
-To check whether a kernel is 64-bit, verify that the ouput of the following command is `x86_64`.
+To check whether a kernel is 64-bit, verify that the output of the following command is `x86_64`.
 
 [source,bash]
 ----
@@ -486,7 +486,7 @@ Run the following:
 | --ip | List of IPs to use for each interface. If --ip and --dest-macs are not specified, the script assumes loopback connections (0&#8596;1, 2&#8596;3 etc.). | --ip 1.2.3.4 5.6.7.8
 |--def-gw | List of default gateways to use for each interface. When using the --ip option, also use the --def_gw option. | --def-gw 3.4.5.6 7.8.9.10
 | --ci | Cores include: White list of cores to use. Include enough cores for each NUMA. | --ci 0 2 4 5 6
-| --ce | Cores exclude: Black list of cores to exclude. When excluding cores, ensure that enough remain for each NUMA. | --ci 10 11 12
+| --ce | Cores exclude: Black list of cores to exclude. When excluding cores, ensure that enough remain for each NUMA. | --ce 10 11 12
 | --no-ht | No HyperThreading: Use only one thread of each core specified in the configuration file. |
 | --prefix | (Advanced option) Prefix to be used in TRex configuration in case of parallel instances. | --prefix first_instance
 | --zmq-pub-port | (Advanced option) ZMQ Publisher port to be used in TRex configuration in case of parallel instances. | --zmq-pub-port 4000
@@ -676,8 +676,8 @@ To connect trex with two VPP memif interfaces:
 ----
   - port_limit: 2
     version: 2
-    interfaces: ["--vdev=net_memif0,socket=/run/vpp/memif.sock,role=slave,id=0",
-                 "--vdev=net_memif1,socket=/run/vpp/memif.sock,role=slave,id=1"]
+    interfaces: ["--vdev=net_memif0,role=slave,id=0,socket-abstract=no,socket=/run/vpp/memif.sock",
+                 "--vdev=net_memif1,role=slave,id=1,socket-abstract=no,socket=/run/vpp/memif.sock"]
 ----
 
 VPP CLI commands to create corresponding interfaces:
@@ -959,7 +959,7 @@ anchor:trex_load_bal[]
 If you want simple VLAN support, this is probably *not* the feature to use. This feature is used for load balancing. To configure VLAN support, see the ``vlan'' field in the xref:trex_config_yaml_config_file[Platform YAML] section.
 
 
-The VLAN Trunk TRex feature attempts to solve the router port bandwidth limitation when the traffic profile is asymmetric (example: Asymmetric SFR profile).
+The VLAN Trunk TRex feature attempts to solve the router port bandwidth limitation when the traffic profile is asymmetric (example: Asymmetric EMIX profile).
 
 This feature converts asymmetric traffic to symmetric, from the port perspective, using router sub-interfaces. This requires TRex to send the traffic on two VLANs, as described below.
 
@@ -985,7 +985,7 @@ For a full file example, see the TRex source in: scripts/cap2/ipv4_load_balance.
 
 *Problem definition:*::
 
-Scenario: TRex with two ports and an SFR traffic profile.
+Scenario: TRex with two ports and an EMIX traffic profile.
 
 .Without VLAN/sub interfaces, all client emulated traffic is sent on port 0, and all server emulated traffic (example: HTTP response) on port 1.
 [source,python]
@@ -1729,7 +1729,7 @@ This mode can provide better connections-per-second performance than mode 1. But
 [bash]>sudo ./t-rex-64 -f cap2/http_simple.yaml -c 4  -l 1000 -d 100000 -m 30  --learn-mode 1
 ----
 
-*SFR traffic without bundling/ALG support*
+*EMIX traffic without bundling/ALG support*
 
 [source,bash]
 ----

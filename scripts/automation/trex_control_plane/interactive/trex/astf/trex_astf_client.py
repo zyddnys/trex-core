@@ -17,6 +17,8 @@ from ..common.trex_exceptions import TRexError, TRexTimeoutError
 from ..common.trex_types import *
 from ..common.trex_types import DEFAULT_PROFILE_ID, ALL_PROFILE_ID
 
+from ..stl.trex_stl_client import STLClient
+
 from .trex_astf_port import ASTFPort
 from .trex_astf_profile import ASTFProfile
 from .topo import ASTFTopologyManager
@@ -44,7 +46,7 @@ class Tunnel:
         self.teid     = teid
         self.version  = version
 
-class ASTFClient(TRexClient):
+class ASTFClient(STLClient):
     port_states = [getattr(ASTFPort, state, 0) for state in astf_states]
 
     def __init__(self,
@@ -122,6 +124,8 @@ class ASTFClient(TRexClient):
         self.astf_profile_state = {'_': 0}
         self.profile_state_change = {}
 
+        STLClient.init(self)
+
     def get_mode(self):
         return "ASTF"
 
@@ -156,6 +160,7 @@ class ASTFClient(TRexClient):
         with self.ctx.logger.suppress(verbose = "warning"):
             self.clear_stats(ports = self.get_all_ports(), clear_xstats = False, clear_traffic = False)
             self.clear_dynamic_traffic_stats()
+            self.clear_pgid_stats(clear_flow_stats=True, clear_latency_stats=True)
         return RC_OK()
 
     def _on_astf_state_chg(self, ctx_state, error, epoch):
@@ -421,6 +426,11 @@ class ASTFClient(TRexClient):
             with self.ctx.logger.suppress():
             # force take the port and ignore any streams on it
                 self.acquire(force = True)
+
+                # clear STL first
+                self.clear_stl_profiles(ports)
+                self.clear_pgid_stats(clear_flow_stats=True, clear_latency_stats=True)
+
                 self.stop(False, pid_input=ALL_PROFILE_ID)
                 self.check_states(ok_states=[self.STATE_ASTF_LOADED, self.STATE_IDLE])
                 self.stop_latency()
@@ -853,13 +863,22 @@ class ASTFClient(TRexClient):
                 raise TRexError(rc.err())
 
     @client_api('getter', True)
-    def get_profiles(self):
+    def get_profiles(self, profiles_in_ports = False):
         """
             Get profile list from Server.
 
+            :parameters:
+                profiles_in_ports: bool
+                    Get Stateless profiles also in all available ports
+                    Default is False
+
+            :returns:
+                List of profile names. When profiles_in_ports parameter is specified,
+                a dictionary for all available ports is included in the list.
         """
         params = {
             'handler': self.handler,
+            'profiles_in_ports': profiles_in_ports,
             }
         self.ctx.logger.pre_cmd('Getting profile list.')
         rc = self._transmit('get_profile_list', params = params)
@@ -870,7 +889,7 @@ class ASTFClient(TRexClient):
         return rc.data()
 
     @client_api('getter', True)
-    def get_flow_info(self, profile_id = DEFAULT_PROFILE_ID, duration = 0):
+    def get_flow_info(self, profile_id = DEFAULT_PROFILE_ID, duration = 0, index = None):
         """
             Get TCP flow information
 
@@ -882,18 +901,57 @@ class ASTFClient(TRexClient):
                     Requests stacked TCP flow information during duration time
                     Default value is 0 which means one time request.
 
+                index: int
+                    Retreive TCP flow information from the index of stacked data to the last index.
+                    For the first call, use 0 for all stacked data.
+                    And the next call, use "next_index" value in flows from the previous result.
+
+            :returns:
+                dictionary of <flow_id> : [ <flow_info>, ... ] pair.
+                - <flow_id> is represented by "<src_ip>:<src_port>-<dst_ip>:<dst_port>".
+                - <flow_info> is dictionary that contains following key-value pairs.
+
+                    - "origin" : "client" or "server"
+                    - "duration" : elapsed time after established, msec as TCP timer resolution(10 msec)
+
+                    - "state" : TCP state as a number.
+                        0 - CLOSED, 1 - LISTEN, 2 - SYN_SENT, 3 - SYN_RECCEIVED,
+                        4 - ESTABLISHED, 5 - CLOSE_WAIT, ...
+
+                    - "options" : "/timestamps", "/sack", "/wscale"
+                    - "snd_wscale" : window scaling for send window, with "/wscale" only
+                    - "rcv_wscale" : window scaling for recv window, with "/wscale" only
+                    - "rto" : current retransmit value (msec)
+                    - "last_data_recv" : inactivity time (msec)
+                    - "rtt" : smoothed round-trip time, msec >> TCP_RTT_SHIFT(5)
+                    - "rttvar" : variance in round-trip time, msec >> TCP_RTTVAR_SHIFT(4)
+                    - "snd_ssthresh" : snd_cwnd size threshold for slow start exponential to linear switch
+                    - "snd_cwnd" : congestion-controlled window size
+
+                    - "rcv_space" : receive window size
+                    - "rcv_nxt" : receive next, distance value from initial receive sequence number
+                    - "snd_wnd" : send window size
+                    - "snd_nxt" : send next, distance value from initial send sequence number
+                    - "snd_mss" : maximum segment size
+                    - "rcv_mss" : maximum segment size
+                    - "snd_rexmitpack" : retransmit packets sent count
+                    - "rcv_ooopack" : out-of-order packets received count
+                    - "snd_zerowin" : zero-window updates sent count
+
+                - When the index parameter is specified, "next_index" key is added as <flow_id>.
+
             :raises:
                 + :exc:`TRexError`
 
         """
         flows = {}
-        index = 0
+        next_index = index if index else 0
 
         timer = PassiveTimer(duration)
         while self._get_profile_state(profile_id) is not self.STATE_IDLE:
             params = {
                 'profile_id': profile_id,
-                'index': index,
+                'index': next_index,
                 }
             rc = self._transmit('get_flow_info', params = params)
             if not rc:
@@ -902,7 +960,7 @@ class ASTFClient(TRexClient):
             for rc_flows in rc.data():
                 for flow_id in rc_flows:
                     if flow_id == 'index':
-                        index = rc_flows[flow_id] + 1
+                        next_index = rc_flows[flow_id] + 1
                     else:
                         flows[flow_id] = flows.get(flow_id, [])
                         flows[flow_id].append(rc_flows[flow_id])
@@ -915,6 +973,9 @@ class ASTFClient(TRexClient):
                 break
 
             time.sleep(min(1.0, duration))
+
+        if index is not None:
+            flows['next_index'] = next_index
 
         return flows
 
@@ -941,6 +1002,10 @@ class ASTFClient(TRexClient):
             TRexClient.wait_on_traffic(self, ports, timeout)
         else:
             self.wait_for_profile_state(profile_id, self.STATE_ASTF_LOADED, timeout)
+
+    
+    
+    wait_on_traffic_stl = STLClient.wait_on_traffic
 
     # get stats
     @client_api('getter', True)
@@ -1129,7 +1194,7 @@ class ASTFClient(TRexClient):
                     clear all the profiles sts
         """
         if clear_all:
-            self.traffic_stats.clear_dynamic_stats(clear_all)
+            self.traffic_stats.clear_dynamic_stats(clear_all = True)
         if pid_input:
             self.traffic_stats.clear_dynamic_stats(pid_input)
         return self.traffic_stats.clear_dynamic_stats(is_sum = True)
@@ -1986,6 +2051,9 @@ class ASTFClient(TRexClient):
         elif opts.stats == 'latency_counters':
             self._show_latency_counters()
 
+        elif opts.stats == 'streams': # STLClient
+            self._show_streams_stats()
+
         else:
             raise TRexError('Unhandled stat: %s' % opts.stats)
 
@@ -2087,6 +2155,8 @@ class ASTFClient(TRexClient):
             self.logger.info(format_text("No profiles found with desired filter.\n", "bold", "magenta"))
 
         text_tables.print_table_with_header(table, header = 'Profile states')
+
+        STLClient.profiles_line(self, line)
 
 
     @console_api('update_tunnel', 'ASTF', True)
@@ -2205,3 +2275,26 @@ class ASTFClient(TRexClient):
 
         else:
             raise TRexError('Unhandled command %s' % opts.command)
+
+    # rename STL console commands
+
+    @console_api('start_stl', 'STL', True)
+    def start_stl_line(self, line):
+        '''Start traffic command'''
+        STLClient.start_line(self, line)
+
+    @console_api('stop_stl', 'STL', True)
+    def stop_stl_line(self, line):
+        '''stop traffic command'''
+        STLClient.stop_line(self, line)
+
+    @console_api('update_stl', 'STL', True)
+    def update_stl_line(self, line):
+        '''update traffic command'''
+        STLClient.update_line(self, line)
+
+    @console_api('stats_stl', 'STL', True)
+    def stats_stl_line(self, line):
+        '''stats traffic command'''
+        STLClient.show_stats_line(self, line)
+

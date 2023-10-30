@@ -35,6 +35,7 @@ limitations under the License.
 #include <iostream>
 #include <sstream>
 #include <unistd.h>
+#include "bp_sim.h"
 
 #if 0
 void sbreserve(struct sockbuf *sb, u_int cc) {
@@ -487,6 +488,21 @@ CEmulAppCmd* CEmulApp::process_cmd_one(CEmulAppCmd * cmd){
             return next_cmd();
         }
         break;
+    case tcADD_VAR :
+        {
+            assert(cmd->u.m_var.m_var_id<apVAR_NUM_SIZE);
+            m_vars[cmd->u.m_var.m_var_id]+=cmd->u.m_var.m_val;
+            return next_cmd();
+        }
+        break;
+    case tcADD_TICK_VAR :
+        {
+            assert(cmd->u.m_tick_var.m_var_id < apVAR_NUM_SIZE);
+            m_tick_vars[cmd->u.m_tick_var.m_var_id] += cmd->u.m_tick_var.m_duration;
+            return next_cmd();
+        }
+        break;
+
     case tcJMPNZ : 
         {
             assert(cmd->u.m_jmpnz.m_var_id<apVAR_NUM_SIZE);
@@ -520,11 +536,32 @@ CEmulAppCmd* CEmulApp::process_cmd_one(CEmulAppCmd * cmd){
             return next_cmd();
         }
         break;
+    case tcJMPCMP :
+        {
+            assert(cmd->u.m_jmpcmp.m_var_id<apVAR_NUM_SIZE);
+
+            if (cmd->u.m_jmpcmp.m_cmp_op(m_vars[cmd->u.m_jmpcmp.m_var_id], cmd->u.m_jmpcmp.m_cmp_val)) {
+                /* action jump  */
+                m_cmd_index+=cmd->u.m_jmpcmp.m_offset-1;
+                /* make sure we are not in at the end */
+                int end=m_program->get_size();
+                if (m_cmd_index>end) {
+                    m_cmd_index=end;
+                }
+            }
+            return next_cmd();
+        }
+        break;
+
     case tcTX_PKT : 
         {
-           m_state=te_NONE;
-           m_api->send_pkt((CUdpFlow *)m_flow,cmd->u.m_tx_pkt.m_buf);
-           return next_cmd();
+            m_state=te_NONE;
+            if (get_emul_addon()) {
+                get_emul_addon()->send_data(this, cmd->u.m_tx_pkt.m_buf);
+            } else {
+                m_api->send_pkt((CUdpFlow *)m_flow, cmd->u.m_tx_pkt.m_buf);
+            }
+            return next_cmd();
         }
         break;
 
@@ -572,6 +609,37 @@ CEmulAppCmd* CEmulApp::process_cmd_one(CEmulAppCmd * cmd){
         }
         break;
 
+    case tcADD_STATS:
+        {
+            inc_app_stats(cmd->u.m_stats.m_stats_id, cmd->u.m_stats.m_val);
+            return next_cmd();
+        }
+        break;
+    case tcADD_TICK_STATS:
+        {
+            uint64_t start_ticks = m_tick_vars[cmd->u.m_stats.m_var_id];
+            uint64_t curr_ticks = m_pctx->m_ctx->m_tick_var->get_curr_tick();
+            uint64_t duration_ticks = curr_ticks - start_ticks;
+
+            inc_app_stats(cmd->u.m_stats.m_stats_id, duration_ticks);
+            return next_cmd();
+        }
+        break;
+
+    case tcSET_TEMPLATE:
+        {
+            m_next_tg_id = cmd->u.m_template.m_tg_id;
+            return next_cmd();
+        }
+    case tcEXEC_TEMPLATE:
+        {
+            if (m_next_tg_id) {
+                exec_template_flow(m_next_tg_id);
+            } else {
+                return next_cmd();
+            }
+        }
+        break;
 
     default:
         assert(0);
@@ -606,6 +674,34 @@ void CEmulApp::next(){
     }
 }
 
+void CEmulApp::inc_app_stats(uint8_t id, uint64_t val){
+    m_pctx->m_appstat.AddStatsVal(m_flow->m_tg_id, id, val);
+}
+
+void CEmulApp::exec_template_flow(uint16_t tg_id){
+
+    m_state=te_NONE;
+
+    auto lpt = m_pctx->m_ctx->get_thread();
+    if (lpt) {
+        lpt->generate_flow(m_pctx, tg_id, m_flow);
+    }
+
+    INC_APP_STAT(m_pctx, m_flow->m_tg_id, flows_total);
+    if (m_last_tg_id && tg_id != m_last_tg_id) {
+        INC_APP_STAT(m_pctx, m_flow->m_tg_id, flows_other);
+    }
+    m_last_tg_id = tg_id;
+}
+
+void CEmulApp::resume_by(CEmulApp* app){
+    if (m_state == te_NONE) {
+        if (app->m_next_tg_id) {
+            m_next_tg_id = app->m_next_tg_id;
+        }
+        run_cmd_delay(1);
+    }
+}
 
 void CEmulApp::run_dpc_callbacks(){
     /* check all signals */
@@ -624,13 +720,17 @@ void CEmulApp::start(bool interrupt){
     /* there is at least one command */
     set_interrupt(interrupt);
     assert(m_program->get_size()>0);
-    if (!is_udp_flow()) {
+    if (unlikely(get_emul_addon())) {
+        m_addon_sts = m_pctx->m_appstat.m_addon_stats.get_addon_sts(m_flow->m_tg_id, get_emul_addon());
+        setup_emul_addon();
+    }
+    if (m_program->is_stream()) {
         m_q.set_window_size(m_api->get_tx_max_space(m_flow));
     }
     CEmulAppCmd * lpcmd=m_program->get_index(m_cmd_index);
     /* inject implicit TCP accept to avoid issue #604 */
     CEmulAppCmd temp_cmd;
-    if (!is_udp_flow() && !m_pctx->m_ctx->is_client_side() && (lpcmd->m_cmd == tcTX_BUFFER)) {
+    if (m_program->is_stream() && !m_pctx->m_ctx->is_client_side() && (lpcmd->m_cmd == tcTX_BUFFER)) {
         temp_cmd.m_cmd = tcCONNECT_WAIT;
         lpcmd = &temp_cmd;
         --m_cmd_index;  // rewind index for next_cmd()
@@ -759,7 +859,14 @@ bool CEmulAppProgram::is_common_commands(tcp_app_cmd_t cmd_id){
          (cmd_id==tcSET_VAR) ||
          (cmd_id==tcJMPNZ) ||
          (cmd_id==tcSET_TICK_VAR) ||
-         (cmd_id==tcJMPDP)
+         (cmd_id==tcJMPDP) ||
+         (cmd_id==tcJMPCMP) ||
+         (cmd_id==tcADD_VAR) ||
+         (cmd_id==tcADD_TICK_VAR) ||
+         (cmd_id==tcADD_STATS) ||
+         (cmd_id==tcADD_TICK_STATS) ||
+         (cmd_id==tcSET_TEMPLATE) ||
+         (cmd_id==tcEXEC_TEMPLATE)
         ){
         return (true);
     }
@@ -888,7 +995,7 @@ void CEmulAppCmd::Dump(FILE *fd){
         fprintf(fd," tcSET_VAR id:%lu, val:%lu\n",(ulong)u.m_var.m_var_id,(ulong)u.m_var.m_val);
         break;
     case tcJMPNZ :
-        fprintf(fd," tcJMPNZ id:%lu, jmp:%d\n",(ulong)u.m_jmpnz.m_var_id,(int)u.m_jmpnz.m_offset);
+        fprintf(fd," tcJMPNZ id:%lu, offset:%d\n",(ulong)u.m_jmpnz.m_var_id,(int)u.m_jmpnz.m_offset);
         break;
 
     case tcTX_PKT :
@@ -923,10 +1030,45 @@ void CEmulAppCmd::Dump(FILE *fd){
         break;
 
     case tcSET_TICK_VAR :
-        fprintf(fd," tcSET_TICK_VAR id:%lu\n",(ulong)u.m_var.m_var_id);
+        fprintf(fd," tcSET_TICK_VAR id:%lu\n",(ulong)u.m_tick_var.m_var_id);
         break;
     case tcJMPDP :
-        fprintf(fd," tcJMPDP id:%lu, jmp:%d, dur:%lu\n",(ulong)u.m_jmpdp.m_var_id,(int)u.m_jmpdp.m_offset,(ulong)u.m_jmpdp.m_duration);
+        fprintf(fd," tcJMPDP id:%lu, offset:%d, dur:%lu\n",(ulong)u.m_jmpdp.m_var_id,(int)u.m_jmpdp.m_offset,(ulong)u.m_jmpdp.m_duration);
+        break;
+
+    case tcJMPCMP :
+        {
+            const char* ops[8] = { "false", "eq", "gt", "ge", "lt", "le", "ne", "true" };
+            auto cmp_op = u.m_jmpcmp.m_cmp_op;
+            int code = (cmp_op(0,1)? 4:0) + (cmp_op(1,0)? 2:0) + (cmp_op(1,1)? 1:0);
+
+            if (code == 7 /* always true */) {
+                fprintf(fd," tcJMPCMP offset:%d\n",(int)u.m_jmpcmp.m_offset);
+            } else {
+                fprintf(fd," tcJMPCMP id:%lu, offset:%d, cmp_op:%s, cmp_val:%lu\n",(ulong)u.m_jmpcmp.m_var_id,(int)u.m_jmpcmp.m_offset,ops[code],(ulong)u.m_jmpcmp.m_cmp_val);
+            }
+        }
+        break;
+
+    case tcADD_VAR :
+        fprintf(fd," tcADD_VAR id:%lu, val:%ld\n",(ulong)u.m_var.m_var_id,u.m_var.m_val);
+        break;
+    case tcADD_TICK_VAR :
+        fprintf(fd," tcADD_TICK_VAR id:%lu, dur:%lu\n",(ulong)u.m_tick_var.m_var_id,(ulong)u.m_tick_var.m_duration);
+        break;
+
+    case tcADD_STATS :
+        fprintf(fd," tcADD_STATS stats_id:%lu, val:%lu\n",(ulong)u.m_stats.m_stats_id,(ulong)u.m_stats.m_val);
+        break;
+    case tcADD_TICK_STATS :
+        fprintf(fd," tcADD_TICK_STATS stats_id:%lu, var_id:%lu\n",(ulong)u.m_stats.m_stats_id,(ulong)u.m_stats.m_var_id);
+        break;
+
+    case tcSET_TEMPLATE :
+        fprintf(fd," tcSET_TEMPLATE tg_id:%lu\n",(ulong)u.m_template.m_tg_id);
+        break;
+    case tcEXEC_TEMPLATE :
+        fprintf(fd," tcEXEC_TEMPLATE\n");
         break;
 
     default:
@@ -966,24 +1108,59 @@ int utl_mbuf_buffer_create_and_copy(uint8_t socket,
 }
 
 
+/*
+ * The mbuf filled with patterns can be cached for other buffers.
+ * It will reduce 2K mbuf usage when lots of buffers are loaded.
+ * To avoid the 16bit refcnt overflow, const-mbuf is used.
+ * The const-mbuf could not be freed because it will stay in the driver's TX descriptor.
+ * In general, the number of cached mbufs is small and has no issue.
+ */
+#define MAX_MBUF_CACHE  32
+static std::map<std::string,rte_mbuf_t*> mbufs_cached[MAX_SOCKETS_SUPPORTED];
+static std::mutex mbufs_cached_mutex[MAX_SOCKETS_SUPPORTED];
+
+static rte_mbuf_t* get_mbuf_cached(uint8_t socket, std::string& fstring) {
+    if (CGlobalInfo::m_do_mbuf_cache) {
+        std::unique_lock<std::mutex> my_lock(mbufs_cached_mutex[socket]);
+
+        auto it = mbufs_cached[socket].find(fstring);
+        if (it != mbufs_cached[socket].end()) {
+            return it->second;
+        }
+    }
+    return nullptr;
+}
+
+static void set_mbuf_cached(uint8_t socket, std::string& fstring, rte_mbuf_t* mbuf) {
+    if (CGlobalInfo::m_do_mbuf_cache && (mbufs_cached[socket].size() < MAX_MBUF_CACHE)) {
+        std::unique_lock<std::mutex> my_lock(mbufs_cached_mutex[socket]);
+
+        if (mbufs_cached[socket].find(fstring) == mbufs_cached[socket].end()) {
+            mbufs_cached[socket][fstring] = mbuf;
+            rte_mbuf_set_as_core_const(mbuf);
+        }
+    }
+}
+
+
 int utl_mbuf_buffer_create_and_copy(uint8_t socket,
                                     CMbufBuffer * buf,
                                     uint32_t blk_size,
                                     uint8_t *d,
                                     uint32_t d_size,
                                     uint32_t size,
-                                    uint8_t *f,
-                                    uint32_t f_size,
+                                    std::string& fill_string,
                                     bool mbuf_const){
 
     buf->Create(blk_size);
     uint8_t cnt = 0;
-    rte_mbuf_t* mbuf_fill = nullptr;
+    rte_mbuf_t* mbuf_fill = get_mbuf_cached(socket, fill_string);
+
     while (size>0) {
         uint32_t alloc_size = bsd_umin(blk_size,size);
         auto copy_size = bsd_umin(d_size, alloc_size);
         rte_mbuf_t* m;
-        if (mbuf_fill && (alloc_size == blk_size)) {
+        if (!copy_size && mbuf_fill && (alloc_size == blk_size)) {
             m = mbuf_fill;
             rte_mbuf_refcnt_update(m, 1);
         } else {
@@ -997,7 +1174,14 @@ int utl_mbuf_buffer_create_and_copy(uint8_t socket,
                 d_size -= copy_size;
             } else if (!mbuf_fill) {
                 mbuf_fill = m; // filled data reference mbuf
+                if (alloc_size == blk_size) {
+                    set_mbuf_cached(socket, fill_string, mbuf_fill);
+                }
             }
+
+            uint8_t* f = (uint8_t*)fill_string.c_str();
+            uint32_t f_size = fill_string.size();
+
             for (auto i = 0; i < (alloc_size-copy_size); i++ ) {
                 *p = (f_size>0) ? f[cnt%f_size]: cnt;
                 cnt++;
@@ -1132,4 +1316,52 @@ void CEmulTxQueue::reset(){
     m_q.clear();
     m_q_tot_bytes=0;
 }
+
+
+CAppStats::CAppStats(uint16_t num_of_tg_ids) {
+    Init(num_of_tg_ids);
+}
+
+CAppStats::~CAppStats() {
+    delete[] m_sts_tg_id;
+}
+
+void CAppStats::Init(uint16_t num_of_tg_ids){
+    m_sts_tg_id = new app_stat_int_t[num_of_tg_ids];
+    assert(m_sts_tg_id && "Operator new failed in udp.cpp/CAppStats::Init");
+    m_num_of_tg_ids = num_of_tg_ids;
+    Clear();
+}
+
+void CAppStats::Clear(){
+
+    for ( uint16_t tg_id = 0; tg_id < m_num_of_tg_ids; tg_id++) {
+        ClearPerTGID(tg_id);
+    }
+    memset(&m_sts,0,sizeof(app_stat_int_t));
+}
+
+void CAppStats::ClearPerTGID(uint16_t tg_id) {
+    memset(m_sts_tg_id+tg_id,0,sizeof(app_stat_int_t));
+}
+
+void CAppStats::Dump(FILE *fd){
+}
+
+void CAppStats::Resize(uint16_t new_num_of_tg_ids){
+    delete[] m_sts_tg_id;
+    Init(new_num_of_tg_ids);
+}
+
+void CAppStats::AddStatsVal(uint16_t tg_id, const uint8_t id, const uint64_t val){
+    uint64_t* counter_p = &m_sts.user_counter_A;
+    if (id < NUM_USER_COUNTERS) {
+        counter_p[id] += val;
+        counter_p = &m_sts_tg_id[tg_id].user_counter_A;
+        counter_p[id] += val;
+    }
+}
+
+
+std::vector<CEmulAddon*> CEmulAddonList::m_addon_list;
 

@@ -25,7 +25,6 @@ import cmd
 import json
 import argparse
 import random
-import readline
 import string
 import os
 import sys
@@ -35,6 +34,13 @@ from functools import wraps, partial
 import threading
 import atexit
 import tempfile
+
+
+try:
+    import gnureadline as readline
+except ImportError:
+    import readline
+
 
 if __package__ == None:
     print("TRex console must be launched as a module")
@@ -808,6 +814,11 @@ def setParserOptions():
     parser.add_argument("--emu-server",
                         help="Emulation client server, default is TRex server address")
 
+    parser.add_argument("--emu-server-port", 
+                        help = "Emu server port [default is 4510]\n",
+                        default = 4510,
+                        type = int)
+
     parser.add_argument("--emu-only-server",
                         nargs = "?",
                         const = "localhost",
@@ -906,6 +917,7 @@ def run_console(client, logger, options):
 
         # run emu if needed
         console.emu_server = options.emu_server
+        console.emu_server_port = options.emu_server_port
         if options.emu:
             console.do_plugins('load emu')
 

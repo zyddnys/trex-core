@@ -331,7 +331,7 @@ class CTRexGeneral_Test(unittest.TestCase):
     def check_general_scenario_results (self, trex_res, check_latency = True, skip_expected = False):
         """ 
 
-           skip expected is for case of TCP that those value does not exits because we can't predict them 
+           skip expected is for case of TCP that those value does not exist because we can't predict them 
 
         """
 
@@ -581,6 +581,17 @@ class CTRexGeneral_Test(unittest.TestCase):
                 'no_vlan_even_in_software_mode': True,
             },
 
+            'net_iavf': {
+                'rate_percent': 20,
+                'rate_percent_soft': 1,
+                'total_pkts': 1000,
+                'rate_latency': 1,
+                'latency_9k_enable': True,
+                'latency_9k_max_average': 300,
+                'latency_9k_max_latency': 750,
+                'no_vlan_even_in_software_mode': True,
+            },
+
             'net_e1000_igb': {
                 'rate_percent': 80,
                 'total_pkts': 500,
@@ -604,6 +615,16 @@ class CTRexGeneral_Test(unittest.TestCase):
             },
 
             'net_mlx5': {
+                'rate_percent': 40,
+                'rate_percent_soft': 0.01 if cls.is_vf_nics else 1,
+                'total_pkts': 1000,
+                'rate_latency': 0.01 if cls.is_vf_nics else 1,
+                'latency_9k_enable': False if cls.is_vf_nics else True,
+                'latency_9k_max_average': 200,
+                'latency_9k_max_latency': 200,
+            },
+
+            'net_ice': {
                 'rate_percent': 40,
                 'rate_percent_soft': 0.01 if cls.is_vf_nics else 1,
                 'total_pkts': 1000,

@@ -1,7 +1,7 @@
 #ifndef BP_SIM_H
 #define BP_SIM_H
 /*
- Hanoh Haim
+ Hanoch Haim
  Cisco Systems, Inc.
 */
 
@@ -545,13 +545,6 @@ class CCapFileFlowInfo ;
    we are optimizing the allocation dealocation !!!
  */
 
-struct CNodeTcp {
-     double       sim_time;
-     rte_mbuf_t * mbuf;
-     uint8_t      dir;
-};
-
-
 struct CGenNodeBase  {
 public:
 
@@ -652,6 +645,13 @@ public:
             return (false);
         }
     }
+};
+
+
+struct CNodeTcp: public CGenNodeBase {
+     double       sim_time;
+     rte_mbuf_t * mbuf;
+     uint8_t      dir;
 };
 
 
@@ -765,6 +765,7 @@ public:
 
     inline void reset_pkt_in_flow(void);
     inline uint8_t get_plugin_id(void){
+        assert(m_template_info);
         return ( m_template_info->m_plugin_id);
     }
 
@@ -1874,7 +1875,7 @@ public:
     uint16_t            m_payload_offset;
     uint8_t             m_rw_mbuf_size;    /* first R/W mbuf size 64/128/256 */
     uint8_t             m_pad1;
-    uint16_t            m_ro_mbuf_size;    /* the size of the const mbuf, zero if does not exits */
+    uint16_t            m_ro_mbuf_size;    /* the size of the const mbuf, zero if does not exist */
 
 public:
 
@@ -2871,7 +2872,6 @@ public:
     inline CFlowPktInfo * GetPacket(uint32_t index);
     void Append(CPacketIndication * pkt_indication);
     void RemoveAll();
-    void dump_pkt_sizes(void);
     enum load_cap_file_err load_cap_file(std::string cap_file, uint16_t _id, uint8_t plugin_id);
     enum load_cap_file_err load_cap_file(std::string cap_file, uint16_t _id, CFlowYamlInfo &flow_info);
 
@@ -3097,6 +3097,7 @@ class CTcpCtxCb;
 class CSyncBarrier;
 class CAstfDB;
 class CIpInfoBase;
+class CFlowBase;
 
 class CFlowGenListPerThread {
 
@@ -3352,7 +3353,7 @@ public:
     void remove_tcp_profile(profile_id_t profile_id);
     void Delete_tcp_ctx();
 
-    void generate_flow(bool &done, CPerProfileCtx * pctx);
+    void generate_flow(CPerProfileCtx * pctx, uint16_t tg_id = 0, CFlowBase* in_flow = nullptr);
 
     void handle_rx_flush(CGenNode * node,bool on_terminate);
     void handle_tx_fif(CGenNodeTXFIF * node,bool on_terminate);
@@ -3425,7 +3426,6 @@ public:
 public:
     void Dump(FILE *fd);
     void DumpCsv(FILE *fd);
-    void DumpPktSize();
     void UpdateFast();
     double GetCpuUtil();
     double GetCpuUtilRaw();

@@ -49,11 +49,13 @@ void CSTTCpPerTGIDPerDir::Delete() {
 void CSTTCpPerTGIDPerDir::update_counters(bool is_sum, uint16_t tg_id) {
     tcpstat_int_t *lpt = &m_tcp.m_sts;
     udp_stat_int_t *lpt_udp = &m_udp.m_sts;
+    app_stat_int_t *lpt_app = &m_app.m_sts;
     CFlowTableIntStats *lpft = &m_ft.m_sts;
 
     clear_aggregated_counters();
     CGCountersUtl64 tcp((uint64_t *)lpt,sizeof(tcpstat_int_t)/sizeof(uint64_t));
     CGCountersUtl64 udp((uint64_t *)lpt_udp,sizeof(udp_stat_int_t)/sizeof(uint64_t));
+    CGCountersUtl64 app((uint64_t *)lpt_app,sizeof(app_stat_int_t)/sizeof(uint64_t));
     double lap_time = 0.0;
     CGCountersUtl32 ft((uint32_t *)lpft,sizeof(CFlowTableIntStats)/sizeof(uint32_t));
 
@@ -61,17 +63,22 @@ void CSTTCpPerTGIDPerDir::update_counters(bool is_sum, uint16_t tg_id) {
         CPerProfileCtx* pctx = m_profile_ctx[i];
         uint64_t *base_tcp;
         uint64_t *base_udp;
+        uint64_t *base_app;
         if (is_sum) {
             base_tcp = (uint64_t *)&pctx->m_tcpstat.m_sts;
             base_udp = (uint64_t *)&pctx->m_udpstat.m_sts;
+            base_app = (uint64_t *)&pctx->m_appstat.m_sts;
         } else {
             base_tcp = (uint64_t *)&pctx->m_tcpstat.m_sts_tg_id[tg_id];
             base_udp = (uint64_t *)&pctx->m_udpstat.m_sts_tg_id[tg_id];
+            base_app = (uint64_t *)&pctx->m_appstat.m_sts_tg_id[tg_id];
         }
         CGCountersUtl64 tcp_ctx(base_tcp,sizeof(tcpstat_int_t)/sizeof(uint64_t));
         CGCountersUtl64 udp_ctx(base_udp,sizeof(udp_stat_int_t)/sizeof(uint64_t));
+        CGCountersUtl64 app_ctx(base_app,sizeof(app_stat_int_t)/sizeof(uint64_t));
         tcp += tcp_ctx;
         udp += udp_ctx;
+        app += app_ctx;
 
         lap_time = std::max(lap_time, pctx->get_time_lap());
     }
@@ -138,18 +145,23 @@ void CSTTCpPerTGIDPerDir::update_counters(bool is_sum, uint16_t tg_id) {
 void CSTTCpPerTGIDPerDir::accumulate_counters(CSTTCpPerTGIDPerDir* lpstt_sts) {
     tcpstat_int_t *lpt = &m_tcp.m_sts;
     udp_stat_int_t *lpt_udp = &m_udp.m_sts;
+    app_stat_int_t *lpt_app = &m_app.m_sts;
 
     tcpstat_int_t *lpstt_tcp = &lpstt_sts->m_tcp.m_sts;
     udp_stat_int_t *lpstt_udp = &lpstt_sts->m_udp.m_sts;
+    app_stat_int_t *lpstt_app = &lpstt_sts->m_app.m_sts;
 
     CGCountersUtl64 tcp((uint64_t *)lpt,sizeof(tcpstat_int_t)/sizeof(uint64_t));
     CGCountersUtl64 udp((uint64_t *)lpt_udp,sizeof(udp_stat_int_t)/sizeof(uint64_t));
+    CGCountersUtl64 app((uint64_t *)lpt_app,sizeof(app_stat_int_t)/sizeof(uint64_t));
 
     CGCountersUtl64 tcp_add((uint64_t *)lpstt_tcp,sizeof(tcpstat_int_t)/sizeof(uint64_t));
     CGCountersUtl64 udp_add((uint64_t *)lpstt_udp,sizeof(udp_stat_int_t)/sizeof(uint64_t));
+    CGCountersUtl64 app_add((uint64_t *)lpstt_app,sizeof(app_stat_int_t)/sizeof(uint64_t));
 
     tcp += tcp_add;
     udp += udp_add;
+    app += app_add;
 }
 
 /* Accumulate dyn counters */
@@ -227,6 +239,7 @@ void CSTTCpPerTGIDPerDir::calculate_avr_counters() {
 void CSTTCpPerTGIDPerDir::clear_sum_counters(void) {
     m_tcp.Clear();
     m_udp.Clear();
+    m_app.Clear();
     m_traffic_duration = 0.0;
     m_ft.Clear();
     for (CDynStsCpGroup* dyn_sts : m_dyn_sts) {
@@ -237,6 +250,7 @@ void CSTTCpPerTGIDPerDir::clear_sum_counters(void) {
 void CSTTCpPerTGIDPerDir::clear_aggregated_counters(void) {
     m_tcp.Clear();
     m_udp.Clear();
+    m_app.Clear();
     m_traffic_duration = 0.0;
     m_ft.Clear();
     //clear dynamic counters
@@ -337,6 +351,13 @@ static CGSimpleBase* create_bar(CGTblClmCounters  * clm,
     return lp;
 }
 
+void CSTTCpPerTGIDPerDir::dump_dyn_stats_desc(Json::Value& result) {
+    result = Json::arrayValue;
+    for (int i = m_clm_static_size; i < m_clm.get_size(); i++) {
+        result.append(m_clm.get_cnt(i)->get_json_desc());
+    }
+}
+
 bool CSTTCpPerTGIDPerDir::add_dyn_stats(const meta_data_t* meta_data, cp_dyn_sts_group_args_t* dyn_sts_group_args) {
     if (m_dyn_sts_range_map.find(meta_data->group_name) != m_dyn_sts_range_map.end()) {
         return false;
@@ -404,6 +425,8 @@ void CSTTCpPerTGIDPerDir::clear_dps_dyn_counters() {
 #define UDP_S_ADD_CNT(f,help)  { create_sc(&m_clm,#f,help,&m_udp.m_sts.f,false,false); }
 #define UDP_S_ADD_CNT_E(f,help)  { create_sc(&m_clm,#f,help,&m_udp.m_sts.f,false,true); }
 
+#define APP_S_ADD_CNT(f,help)  { create_sc(&m_clm,#f,help,&m_app.m_sts.f,false,false); }
+#define APP_S_ADD_CNT_E(f,help)  { create_sc(&m_clm,#f,help,&m_app.m_sts.f,false,true); }
 
 
 #define FT_S_ADD_CNT(f,help)  { create_sc_32(&m_clm,#f,help,&m_ft.m_sts.m_##f,false,false); }
@@ -518,6 +541,13 @@ void CSTTCpPerTGIDPerDir::create_clm_counters(){
     TCP_S_ADD_CNT_E(tcps_sack_send_blocks,"SACK blocks (options) sent");
     TCP_S_ADD_CNT_E(tcps_sack_sboverflow,"times scoreboard overflowed");
 
+    /* TREX_FBSD: ECN counters */
+    TCP_S_ADD_CNT(tcps_ecn_ce,"ECN Congestion Experienced");
+    TCP_S_ADD_CNT(tcps_ecn_ect0,"ECN Capable Transport");
+    TCP_S_ADD_CNT(tcps_ecn_ect1,"ECN Capable Transport");
+    TCP_S_ADD_CNT(tcps_ecn_shs,"ECN successful handshakes");
+    TCP_S_ADD_CNT(tcps_ecn_rcwnd,"times ECN reduced the cwnd");
+
     create_bar(&m_clm,"-");
     create_bar(&m_clm,"UDP");
     create_bar(&m_clm,"-");
@@ -532,6 +562,17 @@ void CSTTCpPerTGIDPerDir::create_clm_counters(){
     UDP_S_ADD_CNT_E(udps_keepdrops,"keepalive drop");
     UDP_S_ADD_CNT_E(udps_nombuf,"no mbuf");
     UDP_S_ADD_CNT_E(udps_pkt_toobig,"packets transmitted too big");
+
+    create_bar(&m_clm,"-");
+    create_bar(&m_clm,"Application");
+    create_bar(&m_clm,"-");
+
+    APP_S_ADD_CNT(user_counter_A,"user counter A");
+    APP_S_ADD_CNT(user_counter_B,"user counter B");
+    APP_S_ADD_CNT(user_counter_C,"user counter C");
+    APP_S_ADD_CNT(user_counter_D,"user counter D");
+    APP_S_ADD_CNT(flows_total,"total flows generated by the command");
+    APP_S_ADD_CNT(flows_other,"generated flows from changed template");
 
 
     create_bar(&m_clm,"-");
@@ -565,6 +606,9 @@ void CSTTCpPerTGIDPerDir::create_clm_counters(){
     FT_S_ADD_CNT_E(err_flow_overflow,"too many flows errors");
     FT_S_ADD_CNT_OK(defer_template,"tcp L7 template matching deferred (by l7_map)");
     FT_S_ADD_CNT_E(err_defer_no_template,"server can't match L7 template (deferred by l7_map)");
+
+
+    m_clm_static_size = m_clm.get_size();
 }
 
 /**
@@ -643,7 +687,7 @@ void CSTTCp::Accumulate(bool clear, bool calculate, CSTTCp* lpstt){
             m_sts[i].clear_sum_counters();
         }
 
-        //accumulate for tcp/udp counters
+        //accumulate for tcp/udp/app counters
         m_sts[i].accumulate_counters(lpstt_sts);
         //accumulate for dynamic counters
         m_sts[i].accumulate_dyn_counters(lpstt_sts);
@@ -706,6 +750,13 @@ void CSTTCp::DumpTGStats(Json::Value &result, const std::vector<uint16_t>& tg_id
     for (auto &tg_id :tg_ids) {
         result[std::to_string(tg_id)] = Json::objectValue;
         m_dtbl_per_tg_id[tg_id]->dump_values("counters per TGID: " + std::to_string(tg_id), false, result[std::to_string(tg_id)]);
+    }
+}
+
+void CSTTCp::DumpTGDynStatsDesc(Json::Value &result) {
+    for (uint16_t tg_id = 0; tg_id < m_num_of_tg_ids; tg_id++) {
+        CSTTCpPerTGIDPerDir* stt = m_sts_per_tg_id[0][tg_id];
+        stt->dump_dyn_stats_desc(result[std::to_string(tg_id)]);
     }
 }
 
@@ -781,6 +832,33 @@ void CSTTCp::Resize(uint16_t new_num_of_tg_ids) {
 
         if (m_sts[i].m_tcp_ctx.size() != m_sts[i].m_profile_ctx.size()) {
             m_profile_ctx_updated = false;
+        }
+    }
+
+    for (int i = 0 ; i < TCP_CS_NUM; i++) {
+        for (uint16_t tg_id = 0; tg_id < m_num_of_tg_ids; tg_id++) {
+            CSTTCpPerTGIDPerDir* stt = m_sts_per_tg_id[i][tg_id];
+            auto addon_list = stt->m_profile_ctx[0]->m_appstat.m_addon_stats.get_addon_list(tg_id);
+            for (auto addon : addon_list) {
+                const meta_data_t meta_data = {
+                    .group_name = addon->get_name(),
+                    .meta_data_per_counter = *addon->get_stats_desc()
+                };
+
+                per_side_dp_sts_vec_t per_side_dp_sts;
+                for (auto pctx : stt->m_profile_ctx) {
+                    CAddonStats& addon_stats = pctx->m_appstat.m_addon_stats;
+                    per_side_dp_sts.push_back(addon_stats.get_addon_sts(tg_id, addon));
+                }
+
+                cp_dyn_sts_group_args_t dyn_sts_group_args = {
+                    .real_counters = nullptr,
+                    .size = meta_data.meta_data_per_counter.size(),
+                    .group_name = meta_data.group_name,
+                    .per_side_dp_sts = per_side_dp_sts,
+                };
+                stt->add_dyn_stats(&meta_data, &dyn_sts_group_args);
+            }
         }
     }
 }

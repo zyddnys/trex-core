@@ -10,7 +10,6 @@
 #include <rte_malloc.h>
 #include <rte_errno.h>
 #include <rte_cycles.h>
-#include <rte_compat.h>
 
 #include "eth_bond_private.h"
 
@@ -636,9 +635,12 @@ tx_machine(struct bond_dev_private *internals, uint16_t slave_id)
 			return;
 		}
 	} else {
-		uint16_t pkts_sent = rte_eth_tx_burst(slave_id,
+		uint16_t pkts_sent = rte_eth_tx_prepare(slave_id,
 				internals->mode4.dedicated_queues.tx_qid,
 				&lacp_pkt, 1);
+		pkts_sent = rte_eth_tx_burst(slave_id,
+				internals->mode4.dedicated_queues.tx_qid,
+				&lacp_pkt, pkts_sent);
 		if (pkts_sent != 1) {
 			rte_pktmbuf_free(lacp_pkt);
 			set_warning_flags(port, WRN_TX_QUEUE_FULL);
@@ -1102,8 +1104,14 @@ bond_mode_8023ad_activate_slave(struct rte_eth_dev *bond_dev,
 
 	snprintf(mem_name, RTE_DIM(mem_name), "slave_port%u_pool", slave_id);
 	port->mbuf_pool = rte_pktmbuf_pool_create(mem_name, total_tx_desc,
+#ifdef TREX_PATCH
+		/* 'total_tx_desc' does not consider the local lcore cache:
+		 * cache disabled because LACP packet does not need high performance. */
+		0,
+#else
 		RTE_MEMPOOL_CACHE_MAX_SIZE >= 32 ?
 			32 : RTE_MEMPOOL_CACHE_MAX_SIZE,
+#endif
 		0, element_size, socket_id);
 
 	/* Any memory allocation failure in initialization is critical because
@@ -1371,9 +1379,12 @@ bond_mode_8023ad_handle_slow_pkt(struct bond_dev_private *internals,
 			}
 		} else {
 			/* Send packet directly to the slow queue */
-			uint16_t tx_count = rte_eth_tx_burst(slave_id,
+			uint16_t tx_count = rte_eth_tx_prepare(slave_id,
 					internals->mode4.dedicated_queues.tx_qid,
 					&pkt, 1);
+			tx_count = rte_eth_tx_burst(slave_id,
+					internals->mode4.dedicated_queues.tx_qid,
+					&pkt, tx_count);
 			if (tx_count != 1) {
 				/* reset timer */
 				port->rx_marker_timer = 0;

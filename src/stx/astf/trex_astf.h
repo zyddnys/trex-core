@@ -28,6 +28,7 @@ limitations under the License.
 #include "common/trex_stx.h"
 #include "trex_astf_defs.h"
 #include "stt_cp.h"
+#include "stl/trex_stl.h"
 
 #include "tunnels/tunnel_factory.h"
 
@@ -106,6 +107,7 @@ public:
     void build();
     void transmit();
     void cleanup();
+    void remove();
     void all_dp_cores_finished(bool partial=false);
     void dp_core_finished();
     void dp_core_finished_partial();
@@ -173,6 +175,8 @@ private:
     std::vector<Json::Value> m_flows_info;
     uint64_t        m_flows_limit;
     uint64_t        m_flows_index;
+
+    bool            m_process_at_cp;    // temporary keep
 };
 
 
@@ -229,7 +233,7 @@ private:
 /***********************************************************
  * TRex adavanced stateful interactive object
  ***********************************************************/
-class TrexAstf : public TrexAstfProfile, public TrexSTX {
+class TrexAstf : public TrexAstfProfile, public TrexStateless {
 public:
     enum state_latency_e {
         STATE_L_IDLE,
@@ -506,6 +510,9 @@ public:
     bool                m_stopping_dp;
     std::vector<int>    m_dp_states;
     std::vector<TrexCpToDpMsgBase*> m_suspended_msgs;
+
+    bool                m_starting_dp;
+    std::vector<TrexCpToDpMsgBase*> m_suspended_core0_msgs;
 };
 
 static inline TrexAstf * get_astf_object() {

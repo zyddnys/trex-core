@@ -224,6 +224,8 @@ enum {
        OPT_HDRH,
        OPT_BNXT_SO,
        OPT_DISABLE_IEEE_1588,
+       OPT_LATENCY_DIAG,
+       OPT_DEFER_START_QUEUES,
 
        /* no more pass this */
        OPT_MAX
@@ -322,6 +324,8 @@ static CSimpleOpt::SOption parser_options[] =
         { OPT_SLEEPY_SCHEDULER,       "--sleeps",          SO_NONE},
         { OPT_BNXT_SO,                "--bnxt-so",         SO_NONE},
         { OPT_DISABLE_IEEE_1588,      "--disable-ieee-1588", SO_NONE},
+        { OPT_LATENCY_DIAG,           "--latency-diag", SO_NONE},
+        { OPT_DEFER_START_QUEUES,     "--defer-start-queues", SO_NONE},
 
         SO_END_OF_OPTIONS
     };
@@ -426,6 +430,9 @@ static int COLD_FUNC  usage() {
     printf(" --disable-ieee-1588        : Enable Latency Measurement using HW timestamping and DPDK APIs. Currently works only for Stateless mode. \n");
     printf("                              Need to Enable COMPILE time DPDK config RTE_LIBRTE_IEEE1588 inorder to use this feature \n");
     printf("                              Uses PTP (IEEE 1588v2) Protocol to have the packets timestamped at NIC \n");
+    printf(" --latency-diag             : STL flow latency counts all duplicated packets with more CPU load consumption.\n");
+    printf("                              To see the duplicated packets, please use -v 7.\n");
+    printf(" --defer-start-queues       : Start queues separately after device started when it is supported.\n");
 
     printf("\n");
     printf(" Examples: ");
@@ -960,6 +967,12 @@ COLD_FUNC static int parse_options(int argc, char *argv[], bool first_time ) {
                 break;
             case OPT_DISABLE_IEEE_1588:
                 po->preview.setLatencyIEEE1588Disable(true);
+                break;
+            case OPT_LATENCY_DIAG:
+                po->preview.set_latency_diag(true);
+                break;
+            case OPT_DEFER_START_QUEUES:
+                po->preview.set_defer_start_queues(true);
                 break;
 
             default:
@@ -1776,7 +1789,7 @@ public:
     uint16_t     m_rx_queue_id[CS_NUM]; 
 };
 
-class CCoreEthIFTcp : public CCoreEthIF {
+class CCoreEthIFTcp : public CCoreEthIFStateless {
 public:
     CCoreEthIFTcp() {
         m_rx_queue_id[CLIENT_SIDE]=0xffff;
@@ -1793,6 +1806,7 @@ public:
 
     void set_rx_queue_id(uint16_t client_qid,
                          uint16_t server_qid){
+        CCoreEthIFStateless::set_rx_queue_id(client_qid, server_qid);
         m_rx_queue_id[CLIENT_SIDE]=client_qid;
         m_rx_queue_id[SERVER_SIDE]=server_qid;
     }
@@ -1846,6 +1860,14 @@ COLD_FUNC uint16_t get_client_side_vlan(CVirtualIF * _ifs){
     return(vlan);
 }
 
+
+COLD_FUNC tunnel_cfg_data_t get_client_side_tunnel_cfg_data(CVirtualIF * _ifs){
+    CCoreEthIFTcp * lpif=(CCoreEthIFTcp *)_ifs;
+    CCorePerPort *lp_port = (CCorePerPort *)lpif->get_ports();
+    uint8_t port_id = lp_port->m_port->get_tvpid();
+    tunnel_cfg_data_t tunnel_data=CGlobalInfo::m_options.m_ip_cfg[port_id].get_tunnel_cfg_data();
+    return(tunnel_data);
+}
 
 COLD_FUNC bool CCoreEthIF::Create(uint8_t             core_id,
                         uint8_t             tx_client_queue_id,
@@ -2119,6 +2141,9 @@ HOT_FUNC uint16_t CCoreEthIFTcp::rx_burst(pkt_dir_t dir,
 
 
 HOT_FUNC int CCoreEthIFTcp::send_node(CGenNode *node){
+    if (unlikely(node->m_type == CGenNode::STATELESS_PKT)) {
+        return CCoreEthIFStateless::send_node_service_mode(node);
+    }
     CNodeTcp * node_tcp = (CNodeTcp *) node;
     uint8_t dir=node_tcp->dir;
     CCorePerPort *lp_port = &m_ports[dir];
@@ -3825,6 +3850,10 @@ COLD_FUNC int  CGlobalTRex::device_start(void){
             _if->disable_flow_control();
         }
 
+        if (CGlobalInfo::m_options.preview.get_defer_start_queues()) {
+            _if->start_queues();
+        }
+
         _if->get_port_attr()->add_mac((char *)CGlobalInfo::m_options.get_src_mac_addr(i));
 
         fflush(stdout);
@@ -4048,7 +4077,7 @@ COLD_FUNC void CGlobalTRex::init_stl() {
 }
 
 COLD_FUNC void CGlobalTRex::init_stl_stats() {
-    if (get_dpdk_mode()->dp_rx_queues()) {
+    if (get_dpdk_mode()->dp_rx_queues() || get_is_tcp_mode()) {
         std::vector<TrexStatelessDpCore*> dp_core_ptrs;
         for (int thread_id = 0; thread_id < (int)m_fl.m_threads_info.size(); thread_id++) {
             TrexStatelessDpCore* stl_dp_core = (TrexStatelessDpCore*)m_fl.m_threads_info[thread_id]->get_dp_core();
@@ -4079,6 +4108,8 @@ COLD_FUNC void CGlobalTRex::init_astf() {
     rx_interactive_conf();
     m_stx = new TrexAstf(get_stx_cfg());
     start_master_astf();
+
+    init_stl_stats();
 }
 
 
@@ -4298,10 +4329,15 @@ COLD_FUNC int  CGlobalTRex::device_prob_init(void){
         }
     }
 
-    /*update mtu based on the dev info*/
-    m_port_cfg.m_port_conf.rxmode.mtu = dev_info.max_rx_pktlen - trex_dev_get_overhead_len(dev_info.max_rx_pktlen, 
-                                                                                      dev_info.max_mtu);
+    /* update default mtu based on the dev info */
+    uint32_t overhead_len = trex_dev_get_overhead_len(dev_info.max_rx_pktlen, dev_info.max_mtu);
+    m_port_cfg.m_port_conf.rxmode.mtu = dev_info.max_rx_pktlen - overhead_len;
+
     m_port_cfg.update_var();
+
+    if (global_platform_cfg_info.m_port_mtu) {
+        m_port_cfg.m_port_conf.rxmode.mtu = global_platform_cfg_info.m_port_mtu;
+    }
 
     if (m_port_cfg.m_port_conf.rxmode.mtu > dev_info.max_rx_pktlen ) {
         printf("WARNING: reduce max packet len from %d to %d \n",
@@ -4377,9 +4413,8 @@ COLD_FUNC int  CGlobalTRex::device_prob_init(void){
         }
     }
 
-
     return (0);
-    }
+}
 
 COLD_FUNC int  CGlobalTRex::cores_prob_init(){
     m_max_cores = rte_lcore_count();
@@ -4652,6 +4687,20 @@ COLD_FUNC void CGlobalTRex::update_stats(){
 }
 
 COLD_FUNC tx_per_flow_t CGlobalTRex::get_flow_tx_stats(uint8_t port, uint16_t index) {
+    uint8_t port0;
+    CFlowGenListPerThread * lpt;
+
+    m_stats.m_port[port].m_tx_per_flow[index].clear();
+
+    for (int i=0; i < get_cores_tx(); i++) {
+        lpt = m_fl.m_threads_info[i];
+        port0 = lpt->getDualPortId() * 2;
+        if ((port == port0) || (port == port0 + 1)) {
+            m_stats.m_port[port].m_tx_per_flow[index] +=
+                lpt->m_node_gen.m_v_if->get_stats()[port - port0].m_tx_per_flow[index];
+        }
+    }
+
     return m_stats.m_port[port].m_tx_per_flow[index] - m_stats.m_port[port].m_prev_tx_per_flow[index];
 }
 
@@ -5752,6 +5801,11 @@ COLD_FUNC void CPhyEthIF::configure_rss(){
         configure_rss_astf(false,
                            dpdk_p.get_total_rx_queues(),
                            MAIN_DPDK_RX_Q);
+
+        /* disable HW flow statistics on ASTF mode due to conflicts with STL flow stats. */
+        if (get_is_interactive() && !get_is_stateless()) {
+            CGlobalInfo::m_options.preview.set_disable_hw_flow_stat(true);
+        }
     }
 }
 
@@ -5764,8 +5818,6 @@ COLD_FUNC void CPhyEthIF::conf_multi_rx() {
         } else {
           hash_key_size = dev_info->hash_key_size;
      }
-
-    g_trex.m_port_cfg.m_port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
 
     struct rte_eth_rss_conf *lp_rss = 
         &g_trex.m_port_cfg.m_port_conf.rx_adv_conf.rss_conf;
@@ -5781,6 +5833,11 @@ COLD_FUNC void CPhyEthIF::conf_multi_rx() {
         lp_rss->rss_key = NULL;
     }
     lp_rss->rss_key_len = hash_key_size;
+
+    if (lp_rss->rss_hf)
+	g_trex.m_port_cfg.m_port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+    else
+	g_trex.m_port_cfg.m_port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
 }
 
 COLD_FUNC void CPhyEthIF::conf_hardware_astf_rss() {
@@ -5888,6 +5945,11 @@ COLD_FUNC void CPhyEthIF::_conf_queues(uint16_t tx_qs,
     check_offloads(dev_info, &eth_cfg);
     configure(rx_qs, tx_qs, &eth_cfg);
 
+    if (CGlobalInfo::m_options.preview.get_defer_start_queues()) {
+        cfg.m_rx_conf.rx_deferred_start = true;
+        cfg.m_tx_conf.tx_deferred_start = true;
+    }
+
     /* configure tx que */
     for (uint16_t qid = 0; qid < tx_qs; qid++) {
         tx_queue_setup(qid, tx_descs , socket_id, 
@@ -5933,7 +5995,7 @@ COLD_FUNC void CPhyEthIF::conf_queues(void){
        rx_qs_descs.push_back(dpdk_p.rx_desc_num_data_q);
        rx_qs_drop_qid=0;
     }else{
-       tx_qs = g_trex.m_max_queues_per_port;
+       tx_qs = get_dpdk_mode()->total_tx_queues();
        int i;
        for (i=0; i<rx_qs; i++) {
            uint16_t desc;
@@ -5969,6 +6031,55 @@ COLD_FUNC void CPhyEthIF::conf_queues(void){
                 rss_mode,
                 in_astf_mode);
 
+}
+
+COLD_FUNC void CPhyEthIF::start_queues(void) {
+    struct rte_eth_dev_info dev_info;
+    rte_eth_dev_info_get(m_repid, &dev_info);
+
+    for (int queue_id = 0; queue_id < dev_info.nb_rx_queues; queue_id++) {
+        struct rte_eth_rxq_info rxq_info;
+        int ret = rte_eth_rx_queue_info_get(m_repid, queue_id, &rxq_info);
+        if (ret == 0) {
+            if (rxq_info.conf.rx_deferred_start) {
+                ret = rte_eth_dev_rx_queue_start(m_repid, queue_id);
+                if (ret == 0 && isVerbose(6)) {
+                    printf("Port %d RX queue %d deferred start done\n", m_repid, queue_id);
+                }
+            } else {
+                ret = -ENOTSUP;
+            }
+        }
+        if (ret == -ENOTSUP) {
+            printf("Port %d RX queue %d deferred start not supported\n", m_repid, queue_id);
+            continue;
+        }
+        if (ret < 0) {
+            rte_exit(EXIT_FAILURE, "Port %d RX queue %d deferred start failed (%d)\n", m_repid, queue_id, ret);
+        }
+    }
+
+    for (int queue_id = 0; queue_id < dev_info.nb_tx_queues; queue_id++) {
+        struct rte_eth_txq_info txq_info;
+        int ret = rte_eth_tx_queue_info_get(m_repid, queue_id, &txq_info);
+        if (ret == 0) {
+            if (txq_info.conf.tx_deferred_start) {
+                ret = rte_eth_dev_tx_queue_start(m_repid, queue_id);
+                if (ret == 0 && isVerbose(6)) {
+                    printf("Port %d TX queue %d deferred start done\n", m_repid, queue_id);
+                }
+            } else {
+                ret = -ENOTSUP;
+            }
+        }
+        if (ret == -ENOTSUP) {
+            printf("Port %d TX queue %d deferred start not supported\n", m_repid, queue_id);
+            continue;
+        }
+        if (ret < 0) {
+            rte_exit(EXIT_FAILURE, "Port %d TX queue %d deferred start failed (%d)\n", m_repid, queue_id, ret);
+        }
+    }
 }
 
 /**
@@ -6074,12 +6185,17 @@ COLD_FUNC int CPhyEthIF::get_flow_stats(rx_per_flow_t *rx_stats, tx_per_flow_t *
     uint32_t diff_bytes[MAX_FLOW_STATS];
     bool hw_rx_stat_supported = get_ex_drv()->hw_rx_stat_supported();
 
+    // reset allowed only when rx_stats and tx_stats are given.
+    if (reset && !(rx_stats && tx_stats)) {
+        return -1;
+    }
+
     if (hw_rx_stat_supported) {
         if (get_ex_drv()->get_rx_stats(this, diff_pkts, m_stats.m_fdir_prev_pkts
                                        , diff_bytes, m_stats.m_fdir_prev_bytes, min, max) < 0) {
             return -1;
         }
-    } else {
+    } else if (rx_stats != NULL) {
         get_stateless_obj()->get_stats()->get_rx_stats(get_tvpid(), rx_stats, min, max, reset, TrexPlatformApi::IF_STAT_IPV4_ID, get_core_list());
     }
 
@@ -6118,7 +6234,14 @@ COLD_FUNC int CPhyEthIF::get_flow_stats(rx_per_flow_t *rx_stats, tx_per_flow_t *
 }
 
 COLD_FUNC int CPhyEthIF::get_flow_stats_payload(rx_per_flow_t *rx_stats, tx_per_flow_t *tx_stats, int min, int max, bool reset) {
-    get_stateless_obj()->get_stats()->get_rx_stats(get_tvpid(), rx_stats, min, max, reset, TrexPlatformApi::IF_STAT_PAYLOAD, get_core_list());
+    // reset allowed only when rx_stats and tx_stats are given.
+    if (reset && !(rx_stats && tx_stats)) {
+        return -1;
+    }
+
+    if (rx_stats != NULL) {
+        get_stateless_obj()->get_stats()->get_rx_stats(get_tvpid(), rx_stats, min, max, reset, TrexPlatformApi::IF_STAT_PAYLOAD, get_core_list());
+    }
     
     for (int i = min; i <= max; i++) {
         if ( reset ) {
@@ -6278,9 +6401,23 @@ COLD_FUNC int update_global_info_from_platform_file(){
             g_opts->m_ip_cfg[i].set_ip(cg->m_mac_info[i].get_ip());
             g_opts->m_ip_cfg[i].set_mask(cg->m_mac_info[i].get_mask());
             g_opts->m_ip_cfg[i].set_vlan(cg->m_mac_info[i].get_vlan());
+            g_opts->m_ip_cfg[i].set_mpls(cg->m_mac_info[i].get_mpls());
             // If one of the ports has vlan, work in vlan mode
             if (cg->m_mac_info[i].get_vlan() != 0) {
-                g_opts->preview.set_vlan_mode_verify(CPreviewMode::VLAN_MODE_NORMAL);
+                // Check if MPLS configuration also specified, tunnel in tunnel EoMPLS[vlan]
+                if (cg->m_mac_info[i].get_mpls().label && !cg->m_mac_info[i].get_is_eompls()) {
+                    printf("\n");
+                    printf("Error: Both MPLS and VLAN configuration is not allowed. Please remove one of them and try again.\n");
+                    exit(1);
+                }
+                if (cg->m_mac_info[i].get_mpls().label) {
+                    g_opts->preview.set_vlan_mode_verify(CPreviewMode::EoMPLS_WITH_VLAN_MODE );
+                } else {
+                    g_opts->preview.set_vlan_mode_verify(CPreviewMode::VLAN_MODE_NORMAL);
+                }
+            } else if (cg->m_mac_info[i].get_mpls().label) {
+                // Currenlty with MPLS Simple MPLS and EoMPLS supported
+                g_opts->preview.set_vlan_mode_verify(cg->m_mac_info[i].get_is_eompls() ? CPreviewMode::EoMPLS_MODE_NORMAL : CPreviewMode::MPLS_MODE_NORMAL);
             }
         }
     }
@@ -7136,6 +7273,17 @@ COLD_FUNC void reorder_dpdk_ports() {
         if ( isVerbose(0) ){
            printf(" size of interfaces_vdevs %d \n",(int)cg->m_if_list_vdevs.size());
         }
+        if ( CGlobalInfo::m_options.m_pdevs_in_vdev.size() ) {
+            /* mapping virtual tvpid for bonding device driver usage.
+             * real tvpid will be updated by next m_if_list_vdevs loop. */
+            int tvpid = cg->m_if_list_vdevs.size();
+            uint8_t cnt = rte_eth_dev_count_avail();
+            for (int repid = 0; repid < cnt; repid++) {
+                lp->set_map(tvpid,repid);
+                lp->set_rmap(repid,tvpid);
+                tvpid++;
+            }
+        }
         int if_index = 0;
         for (std::string &opts : cg->m_if_list_vdevs) {
             if ( CTVPort(if_index).is_dummy() ) {
@@ -7157,6 +7305,7 @@ COLD_FUNC void reorder_dpdk_ports() {
                 printf(" ===>>>found %s %d \n",opts.c_str(),port_id);
             }
             lp->set_map(if_index,port_id);
+            lp->set_rmap(port_id,if_index);
             if_index++;
         }
         return;
@@ -7169,6 +7318,7 @@ COLD_FUNC void reorder_dpdk_ports() {
                     continue;
                 }
                 lp->set_map(i, if_index);
+                lp->set_rmap(if_index, i);
                 if_index++;
             }
             return;
@@ -7409,7 +7559,6 @@ COLD_FUNC int TrexDpdkPlatformApi::get_mbuf_util(Json::Value &mbuf_pool) const {
 }
 
 COLD_FUNC int TrexDpdkPlatformApi::get_pgid_stats(Json::Value &json, std::vector<uint32_t> pgids) const {
-    g_trex.sync_threads_stats();
     CFlowStatRuleMgr::instance()->dump_json(json, pgids);
     return 0;
 }

@@ -332,9 +332,33 @@ trex_rpc_cmd_rc_e
 TrexRpcCmdAstfProfileList::_run(const Json::Value &params, Json::Value &result) {
     vector<string> profile_list = get_astf_object()->get_profile_id_list();
     Json::Value json_profile_list = Json::arrayValue;
+    bool profiles_in_ports = parse_bool(params, "profiles_in_ports", result, false);
 
     for (auto &profile_id : profile_list) {
         json_profile_list.append(profile_id);
+    }
+
+    if (profiles_in_ports) {
+        Json::Value json_ports = Json::objectValue;
+        for (auto &port : get_stateless_obj()->get_port_map()) {
+            profile_list.clear();
+
+            port.second->get_profile_id_list(profile_list);
+            Json::Value json_list = Json::arrayValue;
+
+            for (auto &profile_id : profile_list) {
+                json_list.append(profile_id);
+            }
+
+            if (json_list.size()) {
+                std::stringstream ss;
+                ss << uint16_t(port.first);
+                json_ports[ss.str()] = json_list;
+            }
+        }
+        if (json_ports.size()) {
+            json_profile_list.append(json_ports);
+        }
     }
 
     result["result"] = json_profile_list;
@@ -706,6 +730,7 @@ TrexRpcCmdAstfGetTGNames::_run(const Json::Value &params, Json::Value &result) {
         result["result"]["epoch"] = server_epoch;
         if ( (initialized && server_epoch != epoch) || !initialized)  {
             lpstt->DumpTGNames(result["result"]);
+            lpstt->DumpTGDynStatsDesc(result["result"]["tg_addon_desc"]);
         }
     } else {
         generate_execute_err(result, "Statistics are not initialized yet for TGs");

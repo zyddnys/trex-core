@@ -324,6 +324,10 @@ public:
                                         tvpid_t port_id
                                         );
 
+      bool rx_handle_stateless_packet(CTcpPerThreadCtx * ctx,
+                                      struct rte_mbuf * mbuf,
+                                      tvpid_t port_id);
+
       bool rx_handle_packet(CTcpPerThreadCtx * ctx,
                             struct rte_mbuf * mbuf,
                             bool is_idle,
@@ -406,7 +410,7 @@ public:
                       uint32_t dst,
                       uint16_t src_port,
                       uint16_t dst_port,
-                      uint16_t vlan,
+                      tunnel_cfg_data_t tunnel_data,
                       bool is_ipv6,
                       TCPHeader    * lpTcp,
                       uint8_t *   pkt,
@@ -420,7 +424,7 @@ public:
                           uint32_t dst,
                           uint16_t src_port,
                           uint16_t dst_port,
-                          uint16_t vlan,
+                          tunnel_cfg_data_t tunnel_data,
                           bool is_ipv6,
                           void *tun_handle,
                           uint16_t tg_id=0,
@@ -431,7 +435,7 @@ public:
                               uint32_t dst,
                               uint16_t src_port,
                               uint16_t dst_port,
-                              uint16_t vlan,
+                             tunnel_cfg_data_t tunnel_data,
                               bool is_ipv6,
                               void *tun_handle,
                               bool client,

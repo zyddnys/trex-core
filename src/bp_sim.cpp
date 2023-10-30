@@ -1962,20 +1962,6 @@ bool CCapFileFlowInfo::Create(){
 }
 
 
-void CCapFileFlowInfo::dump_pkt_sizes(void){
-    int i;
-    for (i=0; i<(int)Size(); i++) {
-        flow_pkt_info_t lp=GetPacket((uint32_t)i);
-        CGenNode node;
-        node.m_dest_ip  = 0x10000110;
-        node.m_src_ip   = 0x20000110;
-        node.m_src_port = 12;
-        rte_mbuf_t * buf=lp->generate_new_mbuf(&node);
-        //rte_pktmbuf_dump(buf, buf->pkt_len);
-        rte_pktmbuf_free(buf);
-    }
-}
-
 void CCapFileFlowInfo::RemoveAll(){
     int i;
     clear();
@@ -3605,10 +3591,10 @@ inline int CNodeGenerator::flush_file_realtime(dsec_t max_time,
     m_scheduler_offset = offset;
     dsec_t burst_size = BURST_OFFSET_DTIME;
     if (CGlobalInfo::m_burst_offset_dtime > BURST_OFFSET_DTIME) {
+        burst_size = CGlobalInfo::m_burst_offset_dtime;
         if (CGlobalInfo::m_options.preview.getVMode() > 3) {
             std::cout << "burst_size = " << burst_size << std::endl;
         }
-        burst_size = CGlobalInfo::m_burst_offset_dtime;
     }
 
     thread->m_cpu_dp_u.start_work1();
@@ -4374,6 +4360,7 @@ uint16_t CFlowGenListPerThread::handle_stl_pkts(bool is_idle) {
             if (cnt==0) {
                 break;
             }
+            m_cpu_dp_u.start_work1();   // for TrexDpCore::idle_state_loop()
             int i;
             for (i=0; i<(int)cnt;i++) {
                 rte_mbuf_t * m=rx_pkts[i];
@@ -4428,6 +4415,7 @@ bool CFlowGenListPerThread::check_msgs_from_rx() {
     if ( likely ( m_ring_from_rx->isEmpty() ) ) {
         return false;
     }
+    m_cpu_dp_u.start_work1();   // for TrexDpCore::idle_state_loop()
 
     #ifdef  NAT_TRACE_
     printf(" %.03f got message from RX \n",now_sec());
@@ -4469,7 +4457,10 @@ bool CFlowGenListPerThread::check_msgs() {
     bool had_msg = false;
 
     /* inlined for performance */
-    if (m_dp_core->periodic_check_for_cp_messages()) {
+    if (m_dp_core->are_any_pending_cp_messages()) {
+        m_cpu_dp_u.start_work1();   // for TrexDpCore::idle_state_loop()
+
+        m_dp_core->periodic_check_for_cp_messages();
         had_msg = true;
     }
 
@@ -4761,16 +4752,6 @@ void CFlowGenList::Dump(FILE *fd){
     for (i=0; i<(int)m_cap_gen.size(); i++) {
         CFlowGeneratorRec * lp=m_cap_gen[i];
         lp->Dump(fd);
-    }
-}
-
-
-void CFlowGenList::DumpPktSize(){
-
-    int i;
-    for (i=0; i<(int)m_cap_gen.size(); i++) {
-        CFlowGeneratorRec * lp=m_cap_gen[i];
-        lp->m_flow_info.dump_pkt_sizes();
     }
 }
 

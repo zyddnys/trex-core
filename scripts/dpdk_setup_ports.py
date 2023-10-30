@@ -44,6 +44,7 @@ MLX4_EXIT_CODE = 16
 MLX5_EXIT_CODE = 32
 NTACC_EXIT_CODE = 64
 class VFIOBindErr(Exception): pass
+class PCIgenericBindErr(Exception): pass
 
 PATH_ARR = os.getenv('PATH', '').split(':')
 for path in ['/usr/local/sbin', '/usr/sbin', '/sbin']:
@@ -507,7 +508,7 @@ Other network devices
     def check_ofed_version (self):
         ofed_info='/usr/bin/ofed_info'
 
-        ofed_ver_re = re.compile('.*[-](\d)[.](\d)[-].*')
+        ofed_ver_re = re.compile('.*[-](\d)(\d)?[.](\d)(\d)?[-].*')
 
         ofed_ver = 52
         ofed_ver_show = '5.2'
@@ -528,7 +529,12 @@ Other network devices
         if len(lines)>1:
             m= ofed_ver_re.match(str(lines[0]))
             if m:
-                ver=int(m.group(1))*10+int(m.group(2))
+                if (m.lastindex == 4):
+                    ver=int(m.group(1))*1000+int(m.group(2))*100+int(m.group(3))*10+int(m.group(4))
+                    ofed_ver = 2304
+                    ofed_ver_show = '23.04'
+                else:
+                    ver=int(m.group(1))*10+int(m.group(3))
                 if ver < ofed_ver:
                   print("Installed OFED version is '%s', should be at least '%s' and up." % (lines[0],ofed_ver_show))
                   sys.exit(-1);
@@ -625,6 +631,17 @@ Other network devices
         ret = self.do_bind_all('vfio-pci', to_bind_list)
         if ret:
             raise VFIOBindErr('Binding to vfio_pci failed')
+
+    # pros: no need to compile .ko per Kernel version
+    # cons: need special config/hw (not always works)
+    def try_bind_to_uio_pci_generic(self, to_bind_list):
+        if 'uio_pci_generic' not in dpdk_nic_bind.get_loaded_modules():
+            ret = os.system('modprobe uio_pci_generic')
+            if ret:
+                raise PCIgenericBindErr('Could not load uio_pci_generic')
+        ret = self.do_bind_all('uio_pci_generic', to_bind_list)
+        if ret:
+            raise PCIgenericBindErr('Binding to uio_pci_generic failed')
 
     def pci_name_to_full_name (self,pci_name):
         if pci_name == 'dummy':
@@ -1068,6 +1085,14 @@ Other network devices
                         self.try_bind_to_vfio_pci(to_bind_list)
                         return
                     except VFIOBindErr as e:
+                        pass
+                    #print(e)
+
+                    try:
+                        print('Trying to bind to try_bind_to_uio_pci_generic ...')
+                        self.try_bind_to_uio_pci_generic(to_bind_list)
+                        return
+                    except PCIgenericBindErr as e:
                         pass
                     #print(e)
 

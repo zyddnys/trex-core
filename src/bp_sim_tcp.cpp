@@ -49,6 +49,8 @@ public:
              struct CTcpCb * tp,
              rte_mbuf_t *m);
 
+   void on_flush_tx();
+
    int on_flow_close(CTcpPerThreadCtx *ctx,
                      CFlowBase * flow);
 
@@ -88,6 +90,9 @@ int CTcpIOCb::on_flow_close(CTcpPerThreadCtx *ctx,
     if ( lpgen->IsFreePortRequired(c_pool_idx) ){
         lpgen->FreePort(c_pool_idx,c_idx,flow->m_template.m_src_port);
     }
+
+    flow->resume_base_flow();
+    flow->clear_exec_flow();
     return(0);
 }
 
@@ -98,10 +103,15 @@ int CTcpIOCb::on_redirect_rx(CTcpPerThreadCtx *ctx,
     return(m_p->m_node_gen.m_v_if->redirect_to_rx_core(dir,m)?0:-1);
 }
 
+void CTcpIOCb::on_flush_tx(){
+    m_p->m_node_gen.m_v_if->flush_tx_queue();
+}
+
 int CTcpIOCb::on_tx(CTcpPerThreadCtx *ctx,
                       struct CTcpCb * tp,
                       rte_mbuf_t *m){
     CNodeTcp node_tcp;
+    node_tcp.m_type = 0xFF;
     node_tcp.dir  = m_dir;
     node_tcp.mbuf = m;
 #ifdef TREX_SIM
@@ -326,6 +336,7 @@ uint16_t CFlowGenListPerThread::handle_rx_pkts(bool is_idle) {
             if (cnt==0) {
                 break;
             }
+            m_cpu_dp_u.start_work1();   // for TrexDpCore::idle_state_loop()
             int i;
             for (i=0; i<(int)cnt;i++) {
                 rte_mbuf_t * m=rx_pkts[i];
@@ -385,15 +396,9 @@ static CEmulAppApiUdpImpl  m_udp_bh_api_impl_c;
 
 #ifndef TREX_SIM
 uint16_t get_client_side_vlan(CVirtualIF * _ifs);
+tunnel_cfg_data_t get_client_side_tunnel_cfg_data(CVirtualIF * _ifs);
 #endif
-void CFlowGenListPerThread::generate_flow(bool &done, CPerProfileCtx * pctx){
-
-    done=false;
-
-    if (!pctx || !pctx->is_active()) { // transmit stopped
-        done=true;
-        return;
-    }
+void CFlowGenListPerThread::generate_flow(CPerProfileCtx * pctx, uint16_t _tg_id, CFlowBase* in_flow){
 
     if ( m_c_tcp->is_open_flow_enabled()==false ){
         m_c_tcp->m_ft.inc_err_c_new_flow_throttled_cnt();
@@ -403,18 +408,28 @@ void CFlowGenListPerThread::generate_flow(bool &done, CPerProfileCtx * pctx){
     CAstfTemplatesRW * c_rw = pctx->m_template_rw;
 
     /* choose template index */
-    uint16_t template_id = c_rw->do_schedule_template();
+    uint16_t template_id = c_rw->do_schedule_template(_tg_id);
 
     CAstfPerTemplateRW * cur = c_rw->get_template_by_id(template_id);
     CAstfDbRO    *   cur_tmp_ro = pctx->m_template_ro;
 
-    if (cur->check_limit() || !(cur->m_tuple_gen.has_active_clients())){
-        /* we can't generate a flow, there is a limit  or Clients are not active yet*/
-        return;
-    }
-
     CTupleBase  tuple;
-    cur->m_tuple_gen.GenerateTuple(tuple);
+    if (in_flow) {
+        CAstfPerTemplateRW * in_tmp_rw = c_rw->get_template_by_id(in_flow->m_c_template_idx);
+
+        CClientPool * client_gen = in_tmp_rw->m_tuple_gen.get_client_gen();
+        client_gen->GenerateTuple(tuple, client_gen->get_ip_info_by_idx(in_flow->m_c_idx));
+
+        CServerPoolBase * server_gen = cur->m_tuple_gen.get_server_gen();
+        server_gen->GenerateTuple(tuple);
+    } else {
+        if (cur->check_limit() || !(cur->m_tuple_gen.has_active_clients())){
+            /* we can't generate a flow, there is a limit  or Clients are not active yet*/
+            return;
+        }
+
+        cur->m_tuple_gen.GenerateTuple(tuple);
+    }
 
     if ( tuple.getClientPort() == ILLEGAL_PORT ){
         /* we can't allocate tuple, too much */
@@ -437,17 +452,16 @@ void CFlowGenListPerThread::generate_flow(bool &done, CPerProfileCtx * pctx){
 
     ClientCfgBase * lpc=tuple.getClientCfg();
 
-    uint16_t vlan=0;
+    tunnel_cfg_data_t tunnel_data;
 
     if (lpc) {
         if (lpc->m_initiator.has_vlan()){
-            vlan=lpc->m_initiator.get_vlan();
+            tunnel_data.m_vlan = lpc->m_initiator.get_vlan();
         }
     }else{
-        if ( unlikely(CGlobalInfo::m_options.preview.get_vlan_mode() == CPreviewMode::VLAN_MODE_NORMAL) ) {
-     /* TBD need to fix , should be taken from right port */
+        if ( unlikely(CGlobalInfo::m_options.preview.get_vlan_mode() != CPreviewMode::VLAN_MODE_NONE) ) {
     #ifndef TREX_SIM
-            vlan= get_client_side_vlan(m_node_gen.m_v_if);
+            tunnel_data = get_client_side_tunnel_cfg_data(m_node_gen.m_v_if);
     #endif
         }
     }
@@ -470,7 +484,7 @@ void CFlowGenListPerThread::generate_flow(bool &done, CPerProfileCtx * pctx){
                                                tuple.getClientPort(),
                                                tuple.getServerPort(),
 
-                                               vlan,
+                                               tunnel_data,
                                                is_ipv6,
                                                tuple.getTunnelCtx(),
                                                true,
@@ -482,7 +496,7 @@ void CFlowGenListPerThread::generate_flow(bool &done, CPerProfileCtx * pctx){
                                           tuple.getServer(),
                                           tuple.getClientPort(),
                                           tuple.getServerPort(),
-                                          vlan,
+                                          tunnel_data,
                                           is_ipv6,
                                           tuple.getTunnelCtx(),
                                           tg_id,
@@ -501,6 +515,11 @@ void CFlowGenListPerThread::generate_flow(bool &done, CPerProfileCtx * pctx){
                                 cur->m_client_pool_idx, 
                                 template_id,
                                 true);
+
+    /* set parent flow to continue after c_flow closed */
+    if (in_flow) {
+        c_flow->setup_base_flow(in_flow);
+    }
 
     /* update default mac addrees, dir is zero client side  */
     m_node_gen.m_v_if->update_mac_addr_from_global_cfg(CLIENT_SIDE,c_flow->m_template.m_template_pkt);
@@ -543,9 +562,11 @@ void CFlowGenListPerThread::generate_flow(bool &done, CPerProfileCtx * pctx){
 
     app_c = &c_flow->m_app;
 
+    app_c->set_program(cur_tmp_ro->get_client_prog(template_id));
+    app_c->set_peer_id(cur_tmp_ro->get_template_server_id(template_id));
+
     if (is_udp){
         CUdpFlow * udp_flow=(CUdpFlow*)c_flow;;
-        app_c->set_program(cur_tmp_ro->get_client_prog(template_id));
         app_c->set_bh_api(&m_udp_bh_api_impl_c);
         app_c->set_udp_flow_ctx(udp_flow->m_pctx,udp_flow);
         app_c->set_udp_flow();
@@ -563,7 +584,6 @@ void CFlowGenListPerThread::generate_flow(bool &done, CPerProfileCtx * pctx){
 
     }else{
         CTcpFlow * tcp_flow=(CTcpFlow*)c_flow;
-        app_c->set_program(cur_tmp_ro->get_client_prog(template_id));
         app_c->set_bh_api(&m_tcp_bh_api_impl_c);
         app_c->set_flow_ctx(tcp_flow->m_pctx,tcp_flow);
         if (CGlobalInfo::m_options.preview.getEmulDebug() ){
@@ -639,11 +659,10 @@ void CFlowGenListPerThread::handle_tx_fif(CGenNodeTXFIF * node,
                 }
             }
         }
-        else {
-            bool done;
-            generate_flow(done, node->m_pctx);
+        else if (node->m_pctx && node->m_pctx->is_active()) {
+            generate_flow(node->m_pctx);
             /* when there is no flow to generate, profile stop can be triggered */
-            if (!done && !node->m_pctx->m_template_rw->has_flow_gen() && get_is_interactive()) {
+            if (!node->m_pctx->m_template_rw->has_flow_gen() && get_is_interactive()) {
                 TrexAstfDpCore* astf = (TrexAstfDpCore*)m_dp_core;
                 astf->stop_transmit(node->m_pctx->m_profile_id, false);
 
@@ -741,6 +760,9 @@ void CFlowGenListPerThread::Create_tcp_ctx(void) {
 
     m_c_tcp->Create(active_flows,true);
     m_s_tcp->Create(active_flows,false);
+    m_c_tcp->set_thread(this);
+    m_s_tcp->set_thread(this);
+
     m_c_tcp->set_cb(c_tcp_io);
     m_s_tcp->set_cb(s_tcp_io);
 
@@ -834,12 +856,12 @@ void CFlowGenListPerThread::unload_tcp_profile(profile_id_t profile_id, bool is_
 
     if (astf_db) {
         astf_db->clear_db_ro_rw(nullptr, m_thread_id);
-
-        m_c_tcp->set_template_ro(nullptr, profile_id);
-        m_c_tcp->set_template_rw(nullptr, profile_id);
-        m_s_tcp->set_template_ro(nullptr, profile_id);
-        m_s_tcp->set_template_rw(nullptr, profile_id);
     }
+
+    m_c_tcp->set_template_ro(nullptr, profile_id);
+    m_c_tcp->set_template_rw(nullptr, profile_id);
+    m_s_tcp->set_template_ro(nullptr, profile_id);
+    m_s_tcp->set_template_rw(nullptr, profile_id);
 
     if (is_last) {
         m_sched_accurate = false;

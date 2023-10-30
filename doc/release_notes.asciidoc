@@ -26,6 +26,39 @@ ifdef::backend-docbook[]
 
 endif::backend-docbook[]
 
+== Release 3.04 ==
+
+* Upgrade to DPDK 23.03 for new Cloud drivers 
+** iavf works now for i40evf 
+
+
+== Release 3.03 ==
+
+* minor bug fixes 
+
+== Release 3.02 ==
+* minor change, build issue with 3.01 for mlx5 driver 
+
+== Release 3.01 ==
+
+* DPDK 
+** mlx5 upgrade to new ofed 
+** XL710 bonding fix 
+
+== Release 3.00 ==
+
+* EMU 
+** Crash in case of bad IGMPv3 packet
+** Update IPfix plugin 
+
+* DPDK : Some driver patch 
+
+== Release 2.99 ==
+
+* E810 add drop mode, latency stream filter does not work yet. 
+* i40evf another fix 
+* EMU add client mode for IPFIX plugin 
+
 == Release 2.98 ==
 
 * Upgrade to DPDK 22.03 
@@ -403,7 +436,7 @@ Minor version
 * ASTF keep-alive packet is with ACK bit on
 * STL 
 ** fix Python exception in case of a huge latency packets drop 
-** Support Intel X722 NIC with new firware 
+** Support Intel X722 NIC with new firmware 
 
 == Release 2.60 ==
 

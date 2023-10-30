@@ -37,6 +37,7 @@
  */
 
 #include <vector>
+#include <map>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -229,6 +230,13 @@ typedef enum { tcTX_BUFFER             =1,   /* send buffer of   CMbufBuffer */
                tcTX_MODE               =14,  /* TCP send mode, block, none block */ 
                tcSET_TICK_VAR          =15,  /*  set tick var, used with jmp_dp */
                tcJMPDP                 =16,  /* jump in case time passed from var is less than some duration */
+               tcJMPCMP                =17,  /* conditional/unconditional jump */
+               tcADD_VAR               =18,  /* add value to var */
+               tcADD_TICK_VAR          =19,  /* add value to tick var */
+               tcADD_STATS             =20,  /* add value to statistics counter */
+               tcADD_TICK_STATS        =21,  /* add tick value to statistics counter */
+               tcSET_TEMPLATE          =22,  /* set template to execute */
+               tcEXEC_TEMPLATE         =23,  /* generate a flow from given template */
                tcNO_CMD                =255  /* explicit reset */
 } tcp_app_cmd_enum_t;
 
@@ -274,15 +282,25 @@ struct CEmulAppCmdDelayRnd {
     uint32_t     m_max_ticks;
 };
 
-//tcSET_VAR
+//tcSET_VAR, tcADD_VAR
 struct CEmulAppCmdSetVar {
     uint8_t     m_var_id; /* 2 vars*/
     uint64_t    m_val;
 };
 
-//tcSET_TICK_VAR
+//tcSET_TICK_VAR, tcADD_TICK_VAR
 struct CEmulAppCmdSetTickVar {
-    uint8_t              m_var_id; /* 2 vars */
+    uint8_t     m_var_id; /* 2 vars */
+    uint64_t    m_duration; /* to add duration in ticks */
+};
+
+//tcADD_STATS, tcADD_TICK_STATS
+struct CEmulAppCmdAddStats {
+    uint8_t     m_stats_id;
+    union {
+        uint64_t    m_val; /* value */
+        uint8_t     m_var_id; /* tick variable */
+    };
 };
 
 //tcJMPNZ
@@ -296,6 +314,14 @@ struct CEmulAppCmdJmpDP {
     uint8_t     m_var_id; /* 2 vars*/
     int         m_offset; /* command */
     uint64_t    m_duration; /* duration in ticks */
+};
+
+//tcJMPCMP
+struct CEmulAppCmdJmpCMP {
+    uint8_t     m_var_id; /* 2 vars*/
+    int         m_offset; /* command */
+    bool(*m_cmp_op)(uint64_t,uint64_t); /* comparison function */
+    uint64_t    m_cmp_val; /* comparison value */
 };
 
 /* tcTX_PKT . write pkt. valid for UDP only, should be smaller than MTU */
@@ -321,6 +347,10 @@ struct CEmulAppCmdKeepAlive {
     bool            m_rx_mode; /* keepalive in rx only */
 };
 
+struct CEmulAppCmdTemplate {
+    uint16_t    m_tg_id;
+};
+
 
 /* Commands read-only  */
 struct CEmulAppCmd {
@@ -335,11 +365,14 @@ struct CEmulAppCmd {
         CEmulAppCmdDelayRnd  m_delay_rnd;
         CEmulAppCmdSetVar    m_var;
         CEmulAppCmdSetTickVar m_tick_var;   
+        CEmulAppCmdAddStats  m_stats;
         CEmulAppCmdJmpNZ     m_jmpnz;
-        CEmulAppCmdJmpDP      m_jmpdp;
+        CEmulAppCmdJmpDP     m_jmpdp;
+        CEmulAppCmdJmpCMP    m_jmpcmp;
         CEmulAppCmdTxPkt     m_tx_pkt;
         CEmulAppCmdRxPkt     m_rx_pkt;   
         CEmulAppCmdKeepAlive m_keepalive;   
+        CEmulAppCmdTemplate  m_template;
 
     } u;
 public:
@@ -353,6 +386,114 @@ class CTcpFlow;
 class CUdpFlow;
 class CPerProfileCtx;
 class CTcpPerThreadCtx;
+
+
+/* Add-on */
+class CEmulApp;
+class CMetaDataPerCounter;  // dyn_sts.h required
+using sts_desc_t = std::vector<CMetaDataPerCounter>;
+
+class CEmulAddon {
+    const std::string m_name;
+    const bool m_stream;
+    const uint8_t m_ip_proto;
+
+public:
+    CEmulAddon(std::string name, bool stream, uint8_t ip_proto) : m_name(name), m_stream(stream), m_ip_proto(ip_proto) {}
+    virtual ~CEmulAddon() {}
+
+    std::string const& get_name() const { return m_name; }
+    bool is_stream() const { return m_stream; }
+    uint8_t get_ip_proto() const { return m_ip_proto; }
+
+    virtual uint64_t new_connection_id(uint32_t profile_id, uint32_t template_idx) {
+        return (uint64_t)profile_id << 32 | template_idx;
+    }
+
+    virtual bool get_connection_id(uint8_t *data, uint16_t len, uint64_t& conn_id) = 0;
+
+    virtual void setup_connection(CEmulApp* app) {}
+
+    virtual void close_connection(CEmulApp* app) {}
+
+    virtual void send_data(CEmulApp* app, CMbufBuffer* buf) = 0;
+
+    virtual void recv_data(CEmulApp* app, struct rte_mbuf* m) = 0;
+
+    virtual sts_desc_t* get_stats_desc() const { return nullptr; }
+};
+
+class CEmulAddonList {
+private:
+    static std::vector<CEmulAddon*> m_addon_list;
+
+public:
+    static CEmulAddon* get_addon_by_name(std::string const& name, bool stream) {
+        for (auto addon: m_addon_list) {
+            if ((addon->get_name() == name) && (stream == addon->is_stream())) {
+                return addon;
+            }
+        }
+        return nullptr;
+    }
+
+    static void register_addon(CEmulAddon* addon) {
+        if (!get_addon_by_name(addon->get_name(), addon->is_stream())) {
+            m_addon_list.push_back(addon);
+        }
+    }
+};
+
+#define REGISTER_EMUL_ADDON(addon) \
+static void __attribute__((constructor, used)) addon ## _init(void) { \
+    CEmulAddonList::register_addon(new addon()); \
+}
+
+struct CAddonStats {
+    std::vector<std::map<const CEmulAddon*,uint64_t*>> m_sts_tg_id;
+
+public:
+    ~CAddonStats() {
+        Clear();
+        m_sts_tg_id.clear();
+    }
+
+    void Init(uint16_t num_of_tg_ids) {
+        Clear();
+        m_sts_tg_id.resize(num_of_tg_ids);
+    }
+
+    void Clear() {
+        for (auto& tg_sts: m_sts_tg_id) {
+            for (auto sts: tg_sts) {
+                delete[] sts.second;
+            }
+            tg_sts.clear();
+        }
+    }
+
+    void set_addon_sts(uint16_t tg_id, const CEmulAddon* addon, int num_counters) {
+        if (m_sts_tg_id[tg_id].find(addon) == m_sts_tg_id[tg_id].end()) {
+            m_sts_tg_id[tg_id][addon] = new uint64_t[num_counters]{};
+        }
+    }
+
+    uint64_t* get_addon_sts(uint16_t tg_id, const CEmulAddon* addon) {
+        if (m_sts_tg_id[tg_id].find(addon) != m_sts_tg_id[tg_id].end()) {
+            return m_sts_tg_id[tg_id][addon];
+        }
+        return nullptr;
+    }
+
+    std::vector<const CEmulAddon*> get_addon_list(uint16_t tg_id) const {
+        std::vector<const CEmulAddon*> addon_list;
+        for (auto& tg_sts : m_sts_tg_id[tg_id]) {
+            addon_list.push_back(tg_sts.first);
+        }
+        return addon_list;
+    }
+};
+
 
 /* Api from application to TCP */
 class CEmulAppApi {
@@ -397,6 +538,7 @@ public:
     ~CEmulAppProgram(){ 
         m_cmds.clear();
         m_stream=true;
+        m_addon=nullptr;
     }
 
     void add_cmd(CEmulAppCmd & cmd);
@@ -419,6 +561,15 @@ public:
     void set_stream(bool stream){
         m_stream = stream;
     }
+
+    CEmulAddon* get_addon() const {
+        return m_addon;
+    }
+
+    void set_addon(CEmulAddon* addon) {
+        m_addon = addon;
+    }
+
 private:
     bool is_common_commands(tcp_app_cmd_t cmd_id);
     bool is_udp_commands(tcp_app_cmd_t cmd_id);
@@ -426,6 +577,7 @@ private:
 private:
     bool                   m_stream;
     tcp_app_cmd_list_t     m_cmds; 
+    CEmulAddon*            m_addon; /* add-on protocol info */
 };
 
 
@@ -499,6 +651,40 @@ private:
 };
 
 
+/*****************************************************/
+/* APP Program */
+struct app_stat_int_t {
+    uint64_t    user_counter_A;
+    uint64_t    user_counter_B;
+    uint64_t    user_counter_C;
+    uint64_t    user_counter_D;
+#define NUM_USER_COUNTERS   4
+
+    uint64_t    flows_total;    // total flows generated by the command
+    uint64_t    flows_other;    // generated flows from changed template
+
+};
+
+struct CAppStats {
+    app_stat_int_t* m_sts_tg_id;
+    app_stat_int_t  m_sts;
+    uint16_t        m_num_of_tg_ids;
+    CAddonStats     m_addon_stats;
+public:
+    CAppStats(uint16_t num_of_tg_ids=1);
+    ~CAppStats();
+    void Init(uint16_t num_of_tg_ids);
+    void Clear();
+    void ClearPerTGID(uint16_t tg_id);
+    void Dump(FILE *fd);
+    void Resize(uint16_t new_num_of_tg_ids);
+
+    void AddStatsVal(uint16_t tg_id, const uint8_t id, const uint64_t val);
+};
+
+#define INC_APP_STAT(ctx, tg_id, p) {ctx->m_appstat.m_sts.p++; ctx->m_appstat.m_sts_tg_id[tg_id].p++; }
+#define INC_APP_STAT_CNT(ctx, tg_id, p, cnt) {ctx->m_appstat.m_sts.p += cnt; ctx->m_appstat.m_sts_tg_id[tg_id].p += cnt; }
+
 
 class CEmulApp  {
 public:
@@ -547,10 +733,16 @@ public:
         m_vars[0]=0; /* unroll*/
         m_vars[1]=0;
         assert(apVAR_NUM_SIZE==5);
+        m_next_tg_id = 0;
+        m_last_tg_id = 0;
+        m_emul_addon = nullptr;
+        m_peer_id = 0;
+        m_addon_sts = nullptr;
     }
 
     virtual ~CEmulApp(){
         force_stop_timer();
+        close_emul_addon();
     }
 
     static uint32_t timer_offset(void){
@@ -681,6 +873,10 @@ public:
         return ((m_flags &taRX_DISABLED)?true:false);
     }
 
+    void inc_app_stats(uint8_t id, uint64_t val);
+
+    void exec_template_flow(uint16_t tg_id);
+    void resume_by(CEmulApp* app);
 
     void run_dpc_callbacks();
 
@@ -700,6 +896,7 @@ public:
 
     void set_program(CEmulAppProgram * prog){
         m_program = prog;
+        m_emul_addon = prog->get_addon();
     }
 
     void set_flow_ctx(CPerProfileCtx *  pctx,
@@ -724,6 +921,33 @@ public:
 
     void set_l7_check(bool enable) { m_l7check_enable = enable; }
     bool get_l7_check() const { return m_l7check_enable; }
+
+
+    CEmulAppApi* get_bh_api(){ return m_api; }
+
+    CEmulAddon* get_emul_addon() { return m_emul_addon; }
+
+    void setup_emul_addon() {
+        if (m_emul_addon) {
+            m_emul_addon->setup_connection(this);
+        }
+    }
+
+    void close_emul_addon() {
+        if (m_emul_addon) {
+            m_emul_addon->close_connection(this);
+        }
+    }
+
+    void set_peer_id(uint64_t id) { m_peer_id = id; }
+
+    uint64_t get_peer_id() const { return m_peer_id; }
+
+    void set_priv_data(void* data) { m_priv_data = data; }
+
+    void* get_priv_data() { return m_priv_data; }
+
+    uint64_t* get_addon_sts() const { return m_addon_sts; }
 
 public:
 
@@ -851,6 +1075,14 @@ private:
     /* cache line 3 */
     uint64_t                m_vars[apVAR_NUM_SIZE];
     uint64_t                m_tick_vars[apVAR_NUM_SIZE];
+
+    uint16_t                m_next_tg_id;
+    uint16_t                m_last_tg_id;
+
+    CEmulAddon             *m_emul_addon;
+    uint64_t                m_peer_id;
+    void                   *m_priv_data;
+    uint64_t               *m_addon_sts;
 };
 
 
@@ -949,8 +1181,7 @@ int utl_mbuf_buffer_create_and_copy(uint8_t socket,
                                     uint8_t *d,
                                     uint32_t d_size,
                                     uint32_t size,
-                                    uint8_t *f,
-                                    uint32_t f_size,
+                                    std::string& fill_string,
                                     bool mbuf_const=false);
 
 
